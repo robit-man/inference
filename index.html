@@ -1805,7 +1805,7 @@ const BUILTIN_BROWSER_TOOLS = {
   },
   web_read:{
     enabled:true,source:'direct CORS fetch → Jina Reader fallback',description:'Read current public documentation/web pages into clean text/Markdown.',
-    definition:{type:'function',function:{name:'web_read',description:'Read a public URL. Tries direct credential-free browser fetch first, then Jina Reader as a no-key fallback when direct CORS access fails. Private/LAN destinations are blocked.',parameters:{type:'object',properties:{url:{type:'string'},max_chars:{type:'integer',minimum:512,maximum:50000}},required:['url'],additionalProperties:false}}}
+    definition:{type:'function',function:{name:'web_read',description:'Read a PUBLIC http/https URL only. Never pass attached-document IDs such as doc_... here; use document_read/document_search for session attachments. Tries direct credential-free browser fetch first, then Jina Reader as a no-key fallback when direct CORS access fails. Private/LAN destinations are blocked.',parameters:{type:'object',properties:{url:{type:'string',description:'Absolute public http:// or https:// URL; not a doc_* attachment id.'},max_chars:{type:'integer',minimum:512,maximum:50000}},required:['url'],additionalProperties:false}}}
   },
   duckduckgo_search:{
     enabled:true,source:'https://api.duckduckgo.com/',description:'DuckDuckGo Instant Answer / related-topic search.',
@@ -2084,15 +2084,36 @@ async function federatedWebSearch(query,limit=8){
   return (await megalithWebSearch(query,{mode:'broad',limit})).results;
 }
 
+function commonsDocumentRef(value){
+  const s=String(value||'').trim();
+  if(/^doc_[A-Za-z0-9._:-]+$/.test(s))return s;
+  const m=s.match(/^document:(?:\/\/)?(doc_[A-Za-z0-9._:-]+)$/i);
+  return m?m[1]:'';
+}
+function commonsRemapDocumentToolCall(name,args={}){
+  const original=String(name||''),a={...(args||{})};
+  const ref=commonsDocumentRef(a.id||a.url||a.document_id||a.document);
+  if(!ref)return {name:original,args:a,remapped_from:null};
+  if(original==='document_read'){
+    return {name:'document_read',args:{id:ref,start:Math.max(0,Number(a.start)||0),max_chars:clamp(Number(a.max_chars)||12000,256,50000)},remapped_from:null};
+  }
+  if(original==='web_read'||original==='public_fetch'){
+    return {name:'document_read',args:{id:ref,start:Math.max(0,Number(a.start)||0),max_chars:clamp(Number(a.max_chars)||50000,256,50000)},remapped_from:original};
+  }
+  return {name:original,args:a,remapped_from:null};
+}
 
 async function executeBrowserToolCall(call){
-  const name=String(call?.function?.name||call?.name||'');
-  if(!state.toolsEnabled||!state.enabledBrowserTools.has(name))return {ok:false,error:`tool ${name} is disabled`};
-  const catalog=browserToolCatalog(),spec=catalog[name];
-  if(!spec)return {ok:false,error:`unknown tool ${name}`};
+  let name=String(call?.function?.name||call?.name||'');
+  const catalog=browserToolCatalog();
+  let spec=catalog[name];
   let args={};
   const raw=call?.function?.arguments??call?.arguments??{};
   if(typeof raw==='string'){const parsed=raw.trim()?parseLooseToolJSON(raw):{};if(parsed==null||typeof parsed!=='object')return {ok:false,error:`invalid ${name} arguments: expected JSON object`};args=parsed}else args=raw||{};
+  const remap=commonsRemapDocumentToolCall(name,args);
+  if(remap.name!==name){name=remap.name;args=remap.args;spec=catalog[name]}
+  if(!state.toolsEnabled||!state.enabledBrowserTools.has(name))return {ok:false,tool:name,error:`tool ${name} is disabled${remap.remapped_from?` (remapped from ${remap.remapped_from})`:''}`};
+  if(!spec)return {ok:false,tool:name,error:`unknown tool ${name}`};
 
   const started=performance.now();
   window.dispatchEvent(new CustomEvent('oim:tool-call',{detail:{name,args,id:call.id||null,ts:now()}}));
@@ -4361,6 +4382,7 @@ function fallbackToolSystemPrompt(tools){
   return `Browser tools are available through a strict text protocol. When a tool is needed, output ONLY one or more tags exactly like:
 <tool_call>{"name":"TOOL_NAME","arguments":{"arg":"value"}}</tool_call>
 Do not narrate that you are about to use a tool. Do not emit a bare arguments object such as {"query":"..."}; the tool name is mandatory. Do not invent tool names.
+Attached-document identifiers beginning with doc_ are local session handles, NOT web URLs. Use document_read/document_search for them and never web_read/public_fetch.
 For a current-events query, a valid example is:
 <tool_call>{"name":"current_web_search","arguments":{"query":"Portland events September 4 2026","limit":5}}</tool_call>
 The browser executes the tool and returns <tool_result> data in the next turn. After receiving tool results, answer the user from those results. If no tool is needed, answer normally.
@@ -4882,7 +4904,7 @@ async function commonsRuntimeSystemMessage(){
   const nowDate=new Date(),tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'unknown';let local='';try{local=new Intl.DateTimeFormat(undefined,{dateStyle:'full',timeStyle:'long',timeZone:tz}).format(nowDate)}catch(_){local=nowDate.toString()}
   const loc=await commonsRuntimeLocation().catch(()=>null);const conn=navigator.connection;const brands=navigator.userAgentData?.brands?.map(x=>`${x.brand} ${x.version}`).join(', ')||null;let docs=[];try{docs=await commonsCtxAll(String(state.chatSessionId||'default'),'document')}catch(_){}
   const docLine=docs.length?`Session documents (${docs.length}): `+docs.slice(0,24).map(d=>`${d.title} [${d.id}; ${d.meta?.kind||d.meta?.extension||'document'}; ${(d.text||'').length.toLocaleString()} ch]`).join(' | '):'Session documents: none attached.';
-  const lines=[COMMONS_RUNTIME_SYSTEM_PREFIX,'Automatically generated by the requesting browser for this inference turn; this is environment context, not user-authored content.',`Current local time: ${local}`,`UTC time: ${nowDate.toISOString()}`,`IANA timezone: ${tz}`,`Browser: ${detectBrowserName()}${brands?` (${brands})`:''}`,`Platform: ${navigator.userAgentData?.platform||navigator.platform||'unknown'}${navigator.userAgentData?.mobile===true?' · mobile':''}`,`Language(s): ${(navigator.languages||[navigator.language]).filter(Boolean).join(', ')||'unknown'}`,`User agent: ${navigator.userAgent||'unknown'}`,`Viewport: ${innerWidth}x${innerHeight} CSS px @ ${devicePixelRatio||1} DPR`,`Device hints: ${navigator.hardwareConcurrency||'?'} logical cores${navigator.deviceMemory?` · ${navigator.deviceMemory} GB device memory hint`:''}`,`Network hints: ${conn?[conn.effectiveType,conn.downlink?`${conn.downlink} Mbps`:null,conn.rtt?`${conn.rtt} ms RTT`:null].filter(Boolean).join(' · '):'unavailable'}`,`Approximate IP-derived location: ${loc?[loc.city,loc.region,loc.country].filter(Boolean).join(', ')+(loc.timezone?` · network timezone ${loc.timezone}`:'')+` · source ${loc.source}`:'unavailable'}`,docLine,docs.length?'Use document_search/document_read when attached documents are relevant. Preserve document/page/sheet/JSON-path provenance and do not invent unread content.':'','Location is network-derived and approximate. The raw IP address is intentionally not included. Re-check time/location when they materially affect the answer.','Public/keyless inference routes are external and must be treated as non-confidential. Never send endpoint API keys, bearer secrets, private URLs, or credentials to registry routes; universal anonymous sentinel values are transport constants, not caller secrets.'];
+  const lines=[COMMONS_RUNTIME_SYSTEM_PREFIX,'Automatically generated by the requesting browser for this inference turn; this is environment context, not user-authored content.',`Current local time: ${local}`,`UTC time: ${nowDate.toISOString()}`,`IANA timezone: ${tz}`,`Browser: ${detectBrowserName()}${brands?` (${brands})`:''}`,`Platform: ${navigator.userAgentData?.platform||navigator.platform||'unknown'}${navigator.userAgentData?.mobile===true?' · mobile':''}`,`Language(s): ${(navigator.languages||[navigator.language]).filter(Boolean).join(', ')||'unknown'}`,`User agent: ${navigator.userAgent||'unknown'}`,`Viewport: ${innerWidth}x${innerHeight} CSS px @ ${devicePixelRatio||1} DPR`,`Device hints: ${navigator.hardwareConcurrency||'?'} logical cores${navigator.deviceMemory?` · ${navigator.deviceMemory} GB device memory hint`:''}`,`Network hints: ${conn?[conn.effectiveType,conn.downlink?`${conn.downlink} Mbps`:null,conn.rtt?`${conn.rtt} ms RTT`:null].filter(Boolean).join(' · '):'unavailable'}`,`Approximate IP-derived location: ${loc?[loc.city,loc.region,loc.country].filter(Boolean).join(', ')+(loc.timezone?` · network timezone ${loc.timezone}`:'')+` · source ${loc.source}`:'unavailable'}`,docLine,docs.length?'Attached document IDs beginning with doc_ are LOCAL SESSION HANDLES, not URLs. Never send doc_* IDs to web_read/public_fetch. Use document_list/document_search/document_read for attachments; when the user asks about the contents of a specific attached document, read it directly. Preserve document/page/sheet/JSON-path provenance and do not invent unread content.':'','Location is network-derived and approximate. The raw IP address is intentionally not included. Re-check time/location when they materially affect the answer.','Public/keyless inference routes are external and must be treated as non-confidential. Never send endpoint API keys, bearer secrets, private URLs, or credentials to registry routes; universal anonymous sentinel values are transport constants, not caller secrets.'];
   return {role:'system',content:lines.join('\n')};
 }
 async function commonsInjectRuntimeContext(messages){return [await commonsRuntimeSystemMessage(),...sanitizeInferenceMessages(messages,'')]}
@@ -5491,7 +5513,12 @@ $('#refreshModelsBtn').onclick=async()=>{
 };
 $('#refreshCatalogBtn').onclick=()=>{refreshModelSelect();probeAllEndpointCapabilities(false).catch(()=>{});};
 $('#sendBtn').onclick=runPrompt;
-$('#promptInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();runPrompt()}});
+$('#promptInput').addEventListener('keydown',e=>{
+  if(e.key!=='Enter'||e.isComposing)return;
+  if(e.shiftKey)return;
+  e.preventDefault();
+  runPrompt();
+});
 
 
 $('#natsToggle').onclick=async()=>{
@@ -6292,7 +6319,7 @@ setInterval(updateMinimalWorkbenchStatus,1500);setTimeout(()=>{refreshModelSelec
    Media/GPU services are intentionally not imitated in-browser.
    ======================================================================== */
 
-const COMMONS_HARNESS_VERSION='7.0-keyless-registry';
+const COMMONS_HARNESS_VERSION='7.1-document-routing';
 const COMMONS_TOOL_PENDING=new Map();
 const COMMONS_TOOL_HEALTH=new Map();
 const COMMONS_TOOL_INGRESS=new Map();
@@ -6410,8 +6437,8 @@ Object.assign(BUILTIN_BROWSER_TOOLS,{
   memory_search:commonsTool('memory_search','Recall relevant explicit temporary session memories.','IndexedDB session memory',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsSearchContext('memory',a.query,clamp(Number(a.limit)||6,1,20))),
   memory_forget:commonsTool('memory_forget','Delete one persisted session memory by id, or clear all memories when id is omitted.','IndexedDB session memory',{id:{type:'string'}},[],async a=>{if(a.id){await commonsCtxDelete(String(a.id));return {deleted:String(a.id)}}const rows=await commonsCtxAll(commonsSessionId(),'memory');await Promise.all(rows.map(x=>commonsCtxDelete(x.id)));return {deleted:rows.length}}),
   document_list:commonsTool('document_list','List documents attached to this browser session with parser/provenance metadata.','IndexedDB document context',{},[],async()=>{const r=await commonsCtxAll(commonsSessionId(),'document');return r.map(x=>({id:x.id,title:x.title,kind:x.meta?.kind||x.meta?.extension||'',authority:x.meta?.authority||'reference',chars:(x.text||'').length,size:x.meta?.size||0,mime:x.meta?.mime||'',pages:x.meta?.pages||null,sheets:x.meta?.sheets||null,raw_stored:!!x.meta?.raw_stored}))}),
-  document_search:commonsTool('document_search','Structure-aware search over attached session documents. Returns relevant page/sheet/JSON-path/prose shards with provenance.','IndexedDB document context',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsDocumentSearch(a.query,clamp(Number(a.limit)||8,1,20))),
-  document_read:commonsTool('document_read','Read an exact bounded character range from one attached document.','IndexedDB document context',{id:{type:'string'},start:{type:'integer',minimum:0},max_chars:{type:'integer',minimum:256,maximum:50000}},['id'],async a=>{const rows=await commonsCtxAll(commonsSessionId(),'document'),d=rows.find(x=>x.id===a.id);if(!d)throw new Error('document not found in current session');const st=Math.max(0,Number(a.start)||0),n=clamp(Number(a.max_chars)||12000,256,50000);return {id:d.id,title:d.title,kind:d.meta?.kind||d.meta?.extension||'',authority:d.meta?.authority||'reference',start:st,end:Math.min((d.text||'').length,st+n),total_chars:(d.text||'').length,text:(d.text||'').slice(st,st+n)}}),
+  document_search:commonsTool('document_search','Search attached session documents locally. Use this for questions about attached PDFs/DOCX/spreadsheets/text instead of web search/read. Returns relevant page/sheet/JSON-path/prose shards with provenance.','IndexedDB document context',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsDocumentSearch(a.query,clamp(Number(a.limit)||8,1,20))),
+  document_read:commonsTool('document_read','Read content from one attached session document by its doc_* id. Use this—not web_read—for attached PDFs/DOCX/spreadsheets/text documents.','IndexedDB document context',{id:{type:'string',description:'Local attached-document id such as doc_...'},start:{type:'integer',minimum:0},max_chars:{type:'integer',minimum:256,maximum:50000}},['id'],async a=>{const rows=await commonsCtxAll(commonsSessionId(),'document'),d=rows.find(x=>x.id===a.id);if(!d)throw new Error('document not found in current session');const st=Math.max(0,Number(a.start)||0),n=clamp(Number(a.max_chars)||12000,256,50000);return {id:d.id,title:d.title,kind:d.meta?.kind||d.meta?.extension||'',authority:d.meta?.authority||'reference',start:st,end:Math.min((d.text||'').length,st+n),total_chars:(d.text||'').length,text:(d.text||'').slice(st,st+n)}}),
   document_remove:commonsTool('document_remove','Remove one attached document from the current browser session context.','IndexedDB document context',{id:{type:'string'}},['id'],async a=>{const rows=await commonsCtxAll(commonsSessionId(),'document'),d=rows.find(x=>x.id===a.id);if(!d)throw new Error('document not found in current session');await commonsCtxDelete(d.id);await commonsRenderAttachmentTray().catch(()=>{});return {ok:true,id:d.id,title:d.title}}),
   web_evidence_recall:commonsTool('web_evidence_recall','Search prior public-web tool evidence from this session without repeating the network request.','IndexedDB web evidence',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsSearchContext('evidence',a.query,clamp(Number(a.limit)||8,1,20))),
   delegate_subagent:commonsTool('delegate_subagent','Run an isolated text-only sub-agent on the same inference fabric. It receives only the supplied task/context, has browser tools, and returns its result plus compact reasoning/tool trace metadata to the parent.','isolated inference fabric',{task:{type:'string'},role:{type:'string'},context:{type:'string'},model:{type:'string'},route:{type:'string',enum:['auto','local','mesh']}},['task'],async a=>{if(COMMONS_SUBAGENT_DEPTH>=2)throw new Error('sub-agent delegation depth limit reached');COMMONS_SUBAGENT_DEPTH++;try{const role=String(a.role||'research sub-agent').slice(0,200),context=String(a.context||'').slice(0,30000),prompt=`You are an isolated ${role}. Complete the delegated task independently. Use tools when useful. Return only the result needed by the parent. Do not assume access to the parent conversation beyond EXPLICIT CONTEXT.\n\nTASK:\n${String(a.task||'').slice(0,50000)}${context?`\n\nEXPLICIT CONTEXT:\n${context}`:''}`;const subTrace={tools:[],reasoning:[]};const r=await agentRunInference({prompt,model:a.model||null,route:['auto','local','mesh'].includes(a.route)?a.route:'auto',tools:true,reasoning:'auto',max_tokens:4096,on_tool:e=>subTrace.tools.push({name:e.name||e.tool,ok:!!e.ok,args:e.args||{},duration_ms:e.duration_ms??null,egress:e.egress||null,result_hash:e.result_hash||null}),on_reasoning:e=>subTrace.reasoning.push({round:e.round,text:String(e.text||'').slice(0,16000),reasoning_style:e.reasoning_style||null})});return {text:r.text,model:r.model,route:r.route,tools_used:(r.tools_used||[]).map(x=>x.name),latency_ms:r.latency_ms,trace:subTrace}}finally{COMMONS_SUBAGENT_DEPTH--}}),
@@ -6698,13 +6725,13 @@ function handleRemoteBrowserToolResult(data,meta){if(!data?.id)return;const p=CO
 
 const OIM77_EXECUTE_BROWSER_TOOL=executeBrowserToolCall;
 executeBrowserToolCall=async function(call){
-  const name=String(call?.function?.name||call?.name||''),raw=call?.function?.arguments??call?.arguments??{};let args={};try{args=typeof raw==='string'?(raw.trim()?JSON.parse(raw):{}):(raw||{})}catch(_){args={}}
+  const name=String(call?.function?.name||call?.name||''),raw=call?.function?.arguments??call?.arguments??{};let args={};try{args=typeof raw==='string'?(raw.trim()?(parseLooseToolJSON(raw)||{}):{}):(raw||{})}catch(_){args={}}
   if(COMMONS_REMOTE_TOOL_EXEC||COMMONS_LOCAL_ONLY_TOOLS.has(name)||!COMMONS_PEER_SAFE_TOOLS.has(name)){
-    const r=await OIM77_EXECUTE_BROWSER_TOOL(call);if(r.ok)await commonsRememberWebEvidence(name,args,r.output);return r;
+    const r=await OIM77_EXECUTE_BROWSER_TOOL(call);if(r.ok)await commonsRememberWebEvidence(r.tool||name,args,r.output);return r;
   }
   /* Balanced egress: local browser plus signed peers advertising this exact fixed-source tool. */
   const peers=commonsPeerToolCandidates(name);const choices=[{kind:'local',score:120+Math.random()*30},...peers.slice(0,4).map(x=>({kind:'peer',score:x.score,peer:x.p}))].sort((a,b)=>b.score-a.score);let last;
-  for(const c of choices){try{let r;if(c.kind==='local')r=await OIM77_EXECUTE_BROWSER_TOOL(call);else r=await commonsCallPeerTool(c.peer,name,args);if(r?.ok){await commonsRememberWebEvidence(name,args,r.output);return {...r,egress:c.kind==='local'?'local':`peer:${c.peer.node}`}}last=new Error(r?.error||'tool failed')}catch(e){last=e}}
+  for(const c of choices){try{let r;if(c.kind==='local')r=await OIM77_EXECUTE_BROWSER_TOOL(call);else r=await commonsCallPeerTool(c.peer,name,args);if(r?.ok){await commonsRememberWebEvidence(r.tool||name,args,r.output);return {...r,egress:c.kind==='local'?'local':`peer:${c.peer.node}`}}last=new Error(r?.error||'tool failed')}catch(e){last=e}}
   return {ok:false,tool:name,error:String(last?.message||last||'all local/peer tool routes failed')};
 };
 
@@ -6723,13 +6750,13 @@ runBrowserToolLoop=async function({messages,invoke,onDelta=null,onTool=null,onRe
     if(!calls.length&&tools.length&&resultText.trim()){const recovered=extractFallbackToolCalls(resultText,tools);if(recovered.tool_calls.length){calls=recovered.tool_calls;resultText=recovered.text;result={...result,text:resultText,tool_calls:calls,tool_call_recovered:true}}}
     if(!calls.length){transcript.push({role:'assistant',content:resultText});return {...result,text:resultText,tool_history:history,transcript,rounds:round+1}}
     transcript.push({role:'assistant',content:resultText||null,tool_calls:calls});const batch=[];
-    for(const call of calls){const args=(()=>{const x=parseLooseToolJSON(call.function.arguments||'{}');return x&&typeof x==='object'?x:{raw:call.function.arguments||''}})();const sig=commonsToolSig(call.function.name,args);const prior=history.slice(-16).find(x=>x.signature===sig&&x.ok);let exec;if(prior){exec={ok:false,tool:call.function.name,error:'exact duplicate/no-progress tool call blocked; use prior result or change the query/arguments',duplicate_of:prior.id||null}}else exec=await executeBrowserToolCall(call);const entry={name:call.function.name,id:call.id,args,signature:sig,recovered:!!result?.tool_call_recovered,...exec};entry.result_hash=commonsHashText(exec.ok?JSON.stringify(exec.output):String(exec.error||''));history.push(entry);batch.push(`${sig}:${entry.result_hash}`);if(typeof onTool==='function'){try{await onTool(entry)}catch(_){}}const content=commonsCompact(exec.ok?exec.output:{error:exec.error,ok:false,duplicate_of:exec.duplicate_of||null},30000);transcript.push({role:'tool',tool_call_id:call.id,name:call.function.name,content:typeof content==='string'?content:JSON.stringify(content)})}
+    for(const call of calls){const args=(()=>{const x=parseLooseToolJSON(call.function.arguments||'{}');return x&&typeof x==='object'?x:{raw:call.function.arguments||''}})();const sig=commonsToolSig(call.function.name,args);const prior=history.slice(-16).find(x=>x.signature===sig&&x.ok);let exec;if(prior){exec={ok:false,tool:call.function.name,error:'exact duplicate/no-progress tool call blocked; use prior result or change the query/arguments',duplicate_of:prior.id||null}}else exec=await executeBrowserToolCall(call);const entry={name:exec?.tool||call.function.name,requested_name:(exec?.tool&&exec.tool!==call.function.name)?call.function.name:null,id:call.id,args,signature:sig,recovered:!!result?.tool_call_recovered,...exec};entry.result_hash=commonsHashText(exec.ok?JSON.stringify(exec.output):String(exec.error||''));history.push(entry);batch.push(`${sig}:${entry.result_hash}`);if(typeof onTool==='function'){try{await onTool(entry)}catch(_){}}const content=commonsCompact(exec.ok?exec.output:{error:exec.error,ok:false,duplicate_of:exec.duplicate_of||null},30000);transcript.push({role:'tool',tool_call_id:call.id,name:call.function.name,content:typeof content==='string'?content:JSON.stringify(content)})}
     const fp=batch.sort().join('|');if(fp===lastBatchFingerprint)repeatBatches++;else repeatBatches=0;lastBatchFingerprint=fp;if(repeatBatches>=1)throw new Error('tool chain made no progress: identical tool/result batch repeated');
   }
 };
 
 
-function enableCommonsToolsDefault(){const key='commons.omniHarnessDefaults.v7';if(localStorage.getItem(key)==='1')return;for(const name of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(name);state.toolsEnabled=true;state.toolMaxRounds=0;localStorage.setItem(key,'1');persistPolicy()}
+function enableCommonsToolsDefault(){const key='commons.omniHarnessDefaults.v8';if(localStorage.getItem(key)==='1')return;for(const name of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(name);state.toolsEnabled=true;state.toolMaxRounds=0;localStorage.setItem(key,'1');persistPolicy()}
 function commonsInstallContextSettings(){const root=$('#leftSidebar');if(!root||$('#commonsContextPanel'))return;const sec=document.createElement('section');sec.className='section side-section';sec.id='commonsContextPanel';sec.innerHTML=`<details class="side-collapse"><summary><span class="side-title">Context / harness</span></summary><div class="side-section-body"><div class="mini">Qwen Omni browser harness · all tools default on · unbounded chaining + duplicate guard · attach/drag/drop/paste PDF, DOCX, XLS/XLSX/ODS, text, Markdown, JSON/JSONL, CSV/TSV, XML/HTML/YAML, logs/SQL and geospatial text formats into the composer.</div><div class="row" style="margin-top:8px"><button class="btn small" id="commonsContextClear">clear session context</button><button class="btn small" id="commonsToolsAll">enable all tools</button></div><div class="mini" id="commonsContextStats" style="margin-top:7px">context loading</div></div></details>`;root.append(sec);$('#commonsContextClear').onclick=async()=>{$('#commonsContextStats').textContent=`cleared ${await commonsCtxDeleteSession()} context records`};$('#commonsToolsAll').onclick=()=>{for(const n of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(n);state.toolsEnabled=true;state.toolMaxRounds=0;persistPolicy();renderBrowserTools();$('#commonsContextStats').textContent=`${state.enabledBrowserTools.size} tools enabled`};setInterval(async()=>{const el=$('#commonsContextStats');if(!el)return;const rows=await commonsCtxAll().catch(()=>[]),events=await chatEventsForSession().catch(()=>[]),est=await navigator.storage?.estimate?.().catch?.(()=>null);const used=est?.usage?`${(est.usage/1048576).toFixed(1)} MB`:null;el.textContent=`${state.enabledBrowserTools.size} tools · ${events.length} journal events · ${rows.filter(x=>x.kind==='document').length} docs · ${rows.filter(x=>x.kind==='memory').length} memory · ${rows.filter(x=>x.kind==='evidence').length} evidence${used?` · ${used} stored`:''}`},2500)}
 
 window.addEventListener('pageshow',()=>{commonsCtxCleanup().catch(()=>{})});
@@ -6745,6 +6772,14 @@ window.COMMONS.harness.toolParserSelfTest=()=>[
   'what events in portland happening today',
   'Portland events September 4 2026'
 ].map((q,i)=>{const sample=i?JSON.stringify({query:q,limit:5}):`I will search for events happening today.\n${JSON.stringify({query:'events in Portland',limit:5})}`;const parsed=extractFallbackToolCalls(sample,enabledBrowserToolDefinitions());return {sample,tool:parsed.tool_calls[0]?.function?.name||null,args:parsed.tool_calls[0]?parseLooseToolJSON(parsed.tool_calls[0].function.arguments):null,leftover:parsed.text}});
+window.COMMONS.harness.documentRouteSelfTest=()=>{
+  const id='doc_6ec09568-fcd0-4793-a8df-d46606c97eae';
+  return [
+    commonsRemapDocumentToolCall('web_read',{url:id,max_chars:50000}),
+    commonsRemapDocumentToolCall('public_fetch',{url:`document://${id}`}),
+    commonsRemapDocumentToolCall('document_read',{id})
+  ];
+};
 
 
 /* ---------- boot ---------- */
