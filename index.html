@@ -2092,7 +2092,7 @@ async function executeBrowserToolCall(call){
   if(!spec)return {ok:false,error:`unknown tool ${name}`};
   let args={};
   const raw=call?.function?.arguments??call?.arguments??{};
-  try{args=typeof raw==='string'?(raw.trim()?JSON.parse(raw):{}):(raw||{})}catch(e){return {ok:false,error:`invalid ${name} arguments: ${e.message}`}}
+  if(typeof raw==='string'){const parsed=raw.trim()?parseLooseToolJSON(raw):{};if(parsed==null||typeof parsed!=='object')return {ok:false,error:`invalid ${name} arguments: expected JSON object`};args=parsed}else args=raw||{};
 
   const started=performance.now();
   window.dispatchEvent(new CustomEvent('oim:tool-call',{detail:{name,args,id:call.id||null,ts:now()}}));
@@ -4274,28 +4274,96 @@ function normalizeToolCalls(calls){
     };
   }).filter(c=>/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(c.function.name));
 }
-function extractFallbackToolCalls(text){
-  text=String(text||'');
-  const calls=[];
-  const re=/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-  let m;
-  while((m=re.exec(text))){
-    try{
-      const obj=JSON.parse(m[1]);
-      const name=String(obj.name||obj.function?.name||'');
-      const args=obj.arguments??obj.function?.arguments??{};
-      if(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name)){
-        calls.push({id:`call_${uuid().replaceAll('-','').slice(0,16)}`,type:'function',function:{name,arguments:typeof args==='string'?args:JSON.stringify(args)}});
-      }
-    }catch(_){}
+function parseLooseToolJSON(raw){
+  let s=String(raw||'').trim();if(!s)return null;
+  s=s.replace(/^```(?:json|javascript|js)?\s*/i,'').replace(/\s*```$/,'').trim();
+  try{return JSON.parse(s)}catch(_){}
+  /* Safe repairs only: smart quotes/BOM and trailing commas. Never eval model text. */
+  s=s.replace(/^\uFEFF/,'').replace(/[“”]/g,'"').replace(/[‘’]/g,"'").replace(/,\s*([}\]])/g,'$1');
+  try{return JSON.parse(s)}catch(_){return null}
+}
+function scanToolJsonObjects(text){
+  text=String(text||'');const out=[];let start=-1,depth=0,inString=false,escape=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i];
+    if(inString){if(escape){escape=false;continue}if(ch==='\\'){escape=true;continue}if(ch==='"')inString=false;continue}
+    if(ch==='"'){inString=true;continue}
+    if(ch==='{'){if(depth===0)start=i;depth++;continue}
+    if(ch==='}'&&depth>0){depth--;if(depth===0&&start>=0){out.push({start,end:i+1,raw:text.slice(start,i+1)});start=-1}}
   }
-  return {tool_calls:calls,text:text.replace(re,'').trim()};
+  return out;
+}
+function toolDefsForRecovery(tools){return (Array.isArray(tools)?tools:[]).map(t=>t?.function||t).filter(f=>f&&/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(String(f.name||'')))}
+function inferRecoveredToolName(args,context,tools){
+  if(!args||typeof args!=='object'||Array.isArray(args))return '';
+  const defs=toolDefsForRecovery(tools),keys=Object.keys(args);if(!defs.length||!keys.length)return '';
+  const ctx=(String(context||'')+' '+String(args.query||args.q||'')).toLowerCase();
+  const scored=[];
+  for(const f of defs){
+    const schema=f.parameters&&typeof f.parameters==='object'?f.parameters:{},props=schema.properties||{},required=Array.isArray(schema.required)?schema.required:[];
+    if(required.some(k=>!(k in args)))continue;
+    const known=keys.filter(k=>k in props).length,unknown=keys.length-known;
+    if(known===0&&required.length)continue;
+    let score=required.length*18+known*7-unknown*8;
+    const n=String(f.name||'');
+    if(args.query!=null){
+      if(n==='web_search')score+=34;
+      if(n==='web_search_megalith')score+=20;
+      if(/\b(today|tonight|current|latest|recent|news|event|events|this\s+(?:morning|afternoon|evening|weekend)|\b20\d{2}\b)\b/i.test(ctx)&&n==='current_web_search')score+=85;
+      if(/\b(documentation|docs?|api|sdk|library|package|repository|repo|code|github|stackoverflow)\b/i.test(ctx)&&n==='documentation_search')score+=75;
+      if(/\b(paper|papers|academic|research|study|studies|journal|arxiv|pubmed|doi)\b/i.test(ctx)&&n==='academic_search')score+=75;
+      if(/\b(wikipedia|encyclop|entity|wikidata)\b/i.test(ctx)&&['wikipedia_search','wikidata_search'].includes(n))score+=70;
+      if(/\b(github|repository|repo)\b/i.test(ctx)&&n==='github_search')score+=65;
+      if(/\b(hacker\s*news|hn\b)\b/i.test(ctx)&&n==='hackernews_search')score+=65;
+    }
+    scored.push({name:n,score});
+  }
+  scored.sort((a,b)=>b.score-a.score);return scored[0]?.name||'';
+}
+function recoveredCallsFromObject(obj,context,tools,{allowBare=false}={}){
+  const out=[];if(!obj||typeof obj!=='object')return out;
+  if(Array.isArray(obj)){for(const x of obj.slice(0,8))out.push(...recoveredCallsFromObject(x,context,tools,{allowBare}));return out}
+  if(Array.isArray(obj.tool_calls)){out.push(...normalizeToolCalls(obj.tool_calls));return out}
+  if(obj.tool_call)out.push(...recoveredCallsFromObject(obj.tool_call,context,tools,{allowBare:true}));
+  const explicit=String(obj.name||obj.tool||obj.tool_name||obj.action||obj.function?.name||'');
+  let args=obj.arguments??obj.args??obj.parameters??obj.input??obj.function?.arguments;
+  if(explicit){
+    if(args==null){args={...obj};for(const k of ['name','tool','tool_name','action','function','type','id'])delete args[k]}
+    if(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(explicit))out.push({id:String(obj.id||`call_${uuid().replaceAll('-','').slice(0,16)}`),type:'function',function:{name:explicit,arguments:typeof args==='string'?args:JSON.stringify(args||{})}});
+    return out;
+  }
+  if(allowBare){const name=inferRecoveredToolName(obj,context,tools);if(name)out.push({id:`call_${uuid().replaceAll('-','').slice(0,16)}`,type:'function',function:{name,arguments:JSON.stringify(obj)}})}
+  return out;
+}
+function extractFallbackToolCalls(text,tools=[]){
+  text=String(text||'');const calls=[],seen=new Set();let remaining=text;
+  const add=arr=>{for(const c of normalizeToolCalls(arr)){const sig=`${c.function.name}:${c.function.arguments}`;if(!seen.has(sig)){seen.add(sig);calls.push(c)}}};
+  /* Preferred explicit protocol. */
+  const tagRe=/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+  remaining=remaining.replace(tagRe,(whole,body)=>{const obj=parseLooseToolJSON(body);if(obj)add(recoveredCallsFromObject(obj,text,tools,{allowBare:true}));return obj?'':whole});
+  /* Recovery protocol for models that emit OpenAI-ish JSON or only argument JSON. */
+  const spans=scanToolJsonObjects(remaining),remove=[];
+  const trimmed=remaining.trim();
+  for(const sp of spans.slice(0,12)){
+    const obj=parseLooseToolJSON(sp.raw);if(!obj)continue;
+    const explicit=!!(obj.name||obj.tool||obj.tool_name||obj.action||obj.function||obj.tool_call||obj.tool_calls);
+    const wholeJson=trimmed===sp.raw.trim()||/^```(?:json|javascript|js)?[\s\S]*```$/i.test(trimmed);
+    const intent=/\b(search|look\s*up|find|check|browse|use\s+(?:the\s+)?(?:web|tool)|tool\s*call|events?|today|latest|current|news|research)\b/i.test(remaining.slice(Math.max(0,sp.start-260),sp.start));
+    const recovered=recoveredCallsFromObject(obj,text,tools,{allowBare:wholeJson||intent});
+    if(recovered.length){add(recovered);remove.push([sp.start,sp.end])}
+  }
+  if(remove.length){let out='',at=0;for(const [a,b] of remove.sort((x,y)=>x[0]-y[0])){out+=remaining.slice(at,a);at=Math.max(at,b)}out+=remaining.slice(at);remaining=out}
+  remaining=remaining.replace(/```(?:json|javascript|js)?\s*```/gi,'').replace(/\n{3,}/g,'\n\n').trim();
+  return {tool_calls:calls.slice(0,16),text:remaining,recovered:calls.length>0};
 }
 function fallbackToolSystemPrompt(tools){
   const compact=tools.map(t=>({name:t.function?.name,description:t.function?.description,parameters:t.function?.parameters}));
   return `Browser tools are available through a strict text protocol. When a tool is needed, output ONLY one or more tags exactly like:
 <tool_call>{"name":"TOOL_NAME","arguments":{"arg":"value"}}</tool_call>
-Do not invent tool names. The browser executes the tool and returns <tool_result> data in the next turn. If no tool is needed, answer normally.
+Do not narrate that you are about to use a tool. Do not emit a bare arguments object such as {"query":"..."}; the tool name is mandatory. Do not invent tool names.
+For a current-events query, a valid example is:
+<tool_call>{"name":"current_web_search","arguments":{"query":"Portland events September 4 2026","limit":5}}</tool_call>
+The browser executes the tool and returns <tool_result> data in the next turn. After receiving tool results, answer the user from those results. If no tool is needed, answer normally.
 AVAILABLE TOOLS:
 ${JSON.stringify(compact)}`;
 }
@@ -4401,9 +4469,9 @@ async function callOpenAI(endpointUrl,model,messages,extra={}){
     if(typeof text!=='string')text=text==null?'':JSON.stringify(text);
     let toolCalls=normalizeToolCalls(msg.tool_calls||[]);
     if(requestedTools.length&&!nativeTools){
-      const parsed=extractFallbackToolCalls(text);toolCalls=parsed.tool_calls;text=parsed.text;
+      const parsed=extractFallbackToolCalls(text,requestedTools);toolCalls=parsed.tool_calls;text=parsed.text;
     }
-    if(extra.on_delta&&text)await extra.on_delta(text,text,{mode:responseMode,final:true});
+    if(extra.on_delta&&text&&!toolCalls.length)await extra.on_delta(text,text,{mode:responseMode,final:true});
     const result={
       text,tool_calls:toolCalls,usage:data.usage||null,
       reasoning:msg.reasoning??msg.reasoning_content??null,
@@ -4498,7 +4566,7 @@ async function callOpenAI(endpointUrl,model,messages,extra={}){
 
   let toolCalls=normalizeToolCalls([...toolParts.values()]);
   if(requestedTools.length&&!nativeTools){
-    const parsed=extractFallbackToolCalls(full);toolCalls=parsed.tool_calls;full=parsed.text;
+    const parsed=extractFallbackToolCalls(full,requestedTools);toolCalls=parsed.tool_calls;full=parsed.text;
     if(!toolCalls.length&&full&&extra.on_delta)await extra.on_delta(full,full,{mode:responseMode,final:true});
   }
   if(!full&&!toolCalls.length)throw new Error('stream completed without text or tool calls');
@@ -6043,7 +6111,7 @@ async function commonsCallFreeProvider(key,messages,extra={}){
     const res=await fetchTimeout(p.endpoint,{method:'POST',headers,body:JSON.stringify(body)},Math.min(180000,Number(extra.timeout_ms)||90000));
     if(!res.ok){const err=(await res.text()).slice(0,500);if([429,401,402,403].includes(res.status))st.cooldownUntil=Date.now()+(res.status===429?commonsRetryAfter(res):res.status===402?3600000:900000);throw new Error(`${p.label} HTTP ${res.status}${err?': '+err:''}`)}
     const raw=await res.text();let d;try{d=JSON.parse(raw)}catch{d={text:raw}}let text=commonsContent(d)||raw.trim();if(!text)throw new Error(`${p.label} returned no text`);
-    let tool_calls=[];if(requestedTools.length){const parsed=extractFallbackToolCalls(text);tool_calls=parsed.tool_calls;text=parsed.text}
+    let tool_calls=[];if(requestedTools.length){const parsed=extractFallbackToolCalls(text,requestedTools);tool_calls=parsed.tool_calls;text=parsed.text}
     st.status='up';st.latency=Math.round(performance.now()-t0);st.lastSuccess=Date.now();st.lastError='';st.lastModel=model;
     if(extra.on_delta&&text&&!tool_calls.length)await extra.on_delta(text,text,{mode:extra.response_mode==='chunked'?'chunked':'stream',final:true,provider:key});
     return {text,tool_calls,usage:d?.usage||null,completion_tokens:Number(d?.usage?.completion_tokens)||estimateTextTokens(text),prompt_tokens:Number(d?.usage?.prompt_tokens)||0,total_tokens:Number(d?.usage?.total_tokens)||0,tools_mode:requestedTools.length?'prompt':'off',reasoning_mode:'auto',reasoning_style:'server',free_provider:key,model};
@@ -6154,7 +6222,7 @@ commonsProbeFreeProvider=async function(key,{generation=false}={}){const p=COMMO
 commonsProbeAll=async function(){const rows=await Promise.all(COMMONS_FREE_ORDER.map(k=>commonsProbeFreeProvider(k).catch(e=>({ok:false,id:k,error:String(e.message||e)}))));refreshModelSelect();scheduleAnnounce();updateMinimalWorkbenchStatus();return rows};
 commonsFreeRoute=function(){const a=COMMONS_FREE_ORDER.filter(k=>{const s=COMMONS_FREE_RUNTIME[k];return s&&s.cooldownUntil<=Date.now()&&['up','catalog','unknown'].includes(s.status)}),lat=a.map(k=>COMMONS_FREE_RUNTIME[k].latency).filter(Boolean).sort((x,y)=>x-y)[0]||0;return{model:COMMONS_FREE_MODEL,source:'local',endpoint:'relay://free/auto',label:'FREE FABRIC',type:'free',kind:'free',capabilities:{tools:true,reasoning:false,vision:false,embedding:false,streaming:true,context:32768,family:'keyless-registry-v1'},load:state.freeActiveJobs||0,capacity:Math.max(1,a.length),queue:0,latency:lat,tps:0}};
 async function keylessAIHordeText(rp,p,model,messages,extra={}){const prompt=commonsMessagesText(messages),maxOut=Math.max(16,Math.min(1024,Number(extra.max_tokens)||CONFIG.defaultMaxTokens)),ctx=Math.max(80,Math.min(32000,Math.ceil(prompt.length/3.5)+maxOut)),headers=keylessAuthHeaders(rp);headers.apikey=String(rp.auth?.value||'0000000000');headers['Client-Agent']='open-inference-commons:7';const body={prompt,params:{temperature:Math.max(0,Math.min(5,Number(extra.temperature??0.7))),max_length:maxOut,max_context_length:ctx},models:model?[model]:[],trusted_workers:false},submit=await fetchTimeout(p.endpoint,{method:'POST',headers,body:JSON.stringify(body),credentials:'omit'},Math.min(45000,Number(extra.timeout_ms)||45000));if(!submit.ok)throw Object.assign(new Error(`${rp.name} submit HTTP ${submit.status}: ${(await submit.text()).slice(0,500)}`),{response:submit});const a=await submit.json(),id=a?.id;if(!id)throw new Error(`${rp.name} returned no request id`);const deadline=Date.now()+Math.min(180000,Math.max(15000,Number(extra.timeout_ms)||90000));let polls=0;while(Date.now()<deadline){await new Promise(r=>setTimeout(r,polls?Math.min(2600,1000+polls*130):1000));polls++;const r=await fetchTimeout(`https://aihorde.net/api/v2/generate/text/status/${encodeURIComponent(id)}`,{method:'GET',headers:{apikey:String(rp.auth?.value||'0000000000')},credentials:'omit',cache:'no-store'},12000);if(!r.ok)throw Object.assign(new Error(`${rp.name} status HTTP ${r.status}: ${(await r.text()).slice(0,400)}`),{response:r});const d=await r.json(),gen=(d.generations||[])[0],done=!!d.done||((d.generations||[]).length>0&&(d.processing??0)===0&&(d.waiting??0)===0);if(done&&gen?.text)return{text:String(gen.text),raw:d,job_id:id,polls};if(d.faulted)throw new Error(`${rp.name} job faulted`)}try{await fetch(`https://aihorde.net/api/v2/generate/text/status/${encodeURIComponent(id)}`,{method:'DELETE',headers:{apikey:String(rp.auth?.value||'0000000000')},credentials:'omit'})}catch(_){}throw new Error(`${rp.name} timed out`)}
-commonsCallFreeProvider=async function(key,messages,extra={}){const p=COMMONS_FREE_PROFILES[key],rp=keylessRegistryProvider(key),st=COMMONS_FREE_RUNTIME[key];if(!p||!rp||!st)throw new Error(`unknown registry provider ${key}`);if(rp.tier!=='A'||!rp.enabled_by_default||!rp.capabilities.includes('text'))throw new Error(`${rp.name} is not an active Tier-A text route`);if(st.cooldownUntil>Date.now())throw new Error(`${rp.name} cooling down for ${Math.ceil((st.cooldownUntil-Date.now())/1000)}s`);let model=commonsModelFor(key);if(!model&&!p.modelOptional&&p.modelsEndpoint){await commonsProbeFreeProvider(key);model=commonsModelFor(key)}if(!model&&!p.modelOptional)throw new Error(`${rp.name} has no model candidate`);const tools=sanitizeRemoteTools(extra.tools||[]),wire0=tools.length?prepareFallbackToolMessages(messages,tools):messages,cap=Number(rp.limits?.history_bytes)||0,wire=cap?keylessTrimMessagesBytes(wire0,cap):sanitizeInferenceMessages(wire0,''),est=Math.ceil(JSON.stringify(wire).length/4)+(Number(extra.max_tokens)||CONFIG.defaultMaxTokens),delay=keylessRateDelay(key,model,est);if(delay)throw Object.assign(new Error(`${rp.name} local registry rate bucket blocked for ${Math.ceil(delay/1000)}s`),{code:'local_rate',retryAfterMs:delay});keylessRateCommit(key,model,est);const release=keylessOriginAcquire(p.endpoint),t0=performance.now();let response=null;try{let text='',d=null,usage=null;if(key==='ai_horde'){const h=await keylessAIHordeText(rp,p,model,wire,extra);text=h.text;d=h.raw}else{const headers=keylessAuthHeaders(rp),body={messages:wire,stream:false,temperature:extra.temperature??0.7,max_tokens:extra.max_tokens??CONFIG.defaultMaxTokens};if(!p.modelOptional||model)body.model=model;response=await fetchTimeout(p.endpoint,{method:'POST',headers,body:JSON.stringify(body),credentials:'omit'},Math.min(180000,Number(extra.timeout_ms)||90000));if(!response.ok)throw Object.assign(new Error(`${rp.name} HTTP ${response.status}: ${(await response.text()).slice(0,500)}`),{response});const raw=await response.text();try{d=JSON.parse(raw)}catch{d={text:raw}}text=commonsContent(d)||raw.trim();usage=d?.usage||null}if(!text)throw new Error(`${rp.name} returned no text`);let tool_calls=[];if(tools.length){const parsed=extractFallbackToolCalls(text);tool_calls=parsed.tool_calls;text=parsed.text}keylessSuccess(key,{latency:performance.now()-t0,model,status:response?.status||200});if(extra.on_delta&&text&&!tool_calls.length)await extra.on_delta(text,text,{mode:extra.response_mode==='chunked'?'chunked':'stream',final:true,provider:key,registry_tier:rp.tier});return{text,tool_calls,usage,completion_tokens:Number(usage?.completion_tokens)||estimateTextTokens(text),prompt_tokens:Number(usage?.prompt_tokens)||0,total_tokens:Number(usage?.total_tokens)||0,tools_mode:tools.length?'prompt':'off',reasoning_mode:'auto',reasoning_style:'server',free_provider:key,model:model||null,registry_tier:rp.tier,registry_version:KEYLESS_INFERENCE_REGISTRY.schema_version,privacy:rp.privacy||null}}catch(e){keylessFailure(key,e,e?.response||response);throw e}finally{release()}};
+commonsCallFreeProvider=async function(key,messages,extra={}){const p=COMMONS_FREE_PROFILES[key],rp=keylessRegistryProvider(key),st=COMMONS_FREE_RUNTIME[key];if(!p||!rp||!st)throw new Error(`unknown registry provider ${key}`);if(rp.tier!=='A'||!rp.enabled_by_default||!rp.capabilities.includes('text'))throw new Error(`${rp.name} is not an active Tier-A text route`);if(st.cooldownUntil>Date.now())throw new Error(`${rp.name} cooling down for ${Math.ceil((st.cooldownUntil-Date.now())/1000)}s`);let model=commonsModelFor(key);if(!model&&!p.modelOptional&&p.modelsEndpoint){await commonsProbeFreeProvider(key);model=commonsModelFor(key)}if(!model&&!p.modelOptional)throw new Error(`${rp.name} has no model candidate`);const tools=sanitizeRemoteTools(extra.tools||[]),wire0=tools.length?prepareFallbackToolMessages(messages,tools):messages,cap=Number(rp.limits?.history_bytes)||0,wire=cap?keylessTrimMessagesBytes(wire0,cap):sanitizeInferenceMessages(wire0,''),est=Math.ceil(JSON.stringify(wire).length/4)+(Number(extra.max_tokens)||CONFIG.defaultMaxTokens),delay=keylessRateDelay(key,model,est);if(delay)throw Object.assign(new Error(`${rp.name} local registry rate bucket blocked for ${Math.ceil(delay/1000)}s`),{code:'local_rate',retryAfterMs:delay});keylessRateCommit(key,model,est);const release=keylessOriginAcquire(p.endpoint),t0=performance.now();let response=null;try{let text='',d=null,usage=null;if(key==='ai_horde'){const h=await keylessAIHordeText(rp,p,model,wire,extra);text=h.text;d=h.raw}else{const headers=keylessAuthHeaders(rp),body={messages:wire,stream:false,temperature:extra.temperature??0.7,max_tokens:extra.max_tokens??CONFIG.defaultMaxTokens};if(!p.modelOptional||model)body.model=model;response=await fetchTimeout(p.endpoint,{method:'POST',headers,body:JSON.stringify(body),credentials:'omit'},Math.min(180000,Number(extra.timeout_ms)||90000));if(!response.ok)throw Object.assign(new Error(`${rp.name} HTTP ${response.status}: ${(await response.text()).slice(0,500)}`),{response});const raw=await response.text();try{d=JSON.parse(raw)}catch{d={text:raw}}text=commonsContent(d)||raw.trim();usage=d?.usage||null}if(!text)throw new Error(`${rp.name} returned no text`);let tool_calls=[];if(tools.length){const parsed=extractFallbackToolCalls(text,tools);tool_calls=parsed.tool_calls;text=parsed.text}keylessSuccess(key,{latency:performance.now()-t0,model,status:response?.status||200});if(extra.on_delta&&text&&!tool_calls.length)await extra.on_delta(text,text,{mode:extra.response_mode==='chunked'?'chunked':'stream',final:true,provider:key,registry_tier:rp.tier});return{text,tool_calls,usage,completion_tokens:Number(usage?.completion_tokens)||estimateTextTokens(text),prompt_tokens:Number(usage?.prompt_tokens)||0,total_tokens:Number(usage?.total_tokens)||0,tools_mode:tools.length?'prompt':'off',reasoning_mode:'auto',reasoning_style:'server',free_provider:key,model:model||null,registry_tier:rp.tier,registry_version:KEYLESS_INFERENCE_REGISTRY.schema_version,privacy:rp.privacy||null}}catch(e){keylessFailure(key,e,e?.response||response);throw e}finally{release()}};
 commonsCallFreePool=async function(messages,extra={}){const errors=[];for(const key of [...COMMONS_FREE_ORDER].sort((a,b)=>commonsScore(b)-commonsScore(a))){try{return await commonsCallFreeProvider(key,messages,extra)}catch(e){errors.push(`${key}: ${e.message}`)}}throw new Error(`keyless registry fabric exhausted · ${errors.join(' | ').slice(0,1800)}`)};
 async function keylessRegistryProbe(id,{generation=false}={}){const rp=keylessRegistryProvider(id);if(!rp)throw new Error(`unknown registry provider ${id}`);if(COMMONS_FREE_PROFILES[id])return commonsProbeFreeProvider(id,{generation});if(id==='keylessai_relay'){const t0=performance.now(),r=await fetchTimeout('https://keylessai.thryx.workers.dev/health',{method:'GET',credentials:'omit',cache:'no-store'},8000);return{ok:r.ok,id,tier:rp.tier,status:r.status,latency_ms:Math.round(performance.now()-t0),body:(await r.text()).slice(0,600),quarantined:true}}if(id==='jina_reader')return{ok:true,id,tier:rp.tier,status:'tool-backed',tool:'web_read'};if(['hf_public_gradio_spaces','hf_public_dedicated_endpoint','inference_sh_embed','ahm7_makki'].includes(id))return{ok:true,id,tier:rp.tier,status:'target-specific',note:'Use exact published target and corresponding tool.'};return{ok:false,id,tier:rp.tier,status:'quarantined',note:'No safe generic probe; exact child route/schema required.'}}
 const KEYLESS_BASE_AGENT_SNAPSHOT=agentSnapshot;
@@ -6648,11 +6716,14 @@ getCapabilities=async function(){const body=await COMMONS_V2_GET_CAPS();body.bro
 runBrowserToolLoop=async function({messages,invoke,onDelta=null,onTool=null,onReasoning=null,useTools=true,reasoningMode=state.reasoningMode,responseMode=state.responseMode,chunkSize=state.responseChunkSize,maxRounds=0}={}){
   const transcript=sanitizeInferenceMessages(messages,''),tools=useTools&&state.toolsEnabled?enabledBrowserToolDefinitions():[],history=[];let lastBatchFingerprint='',repeatBatches=0;
   for(let round=0;;round++){
-    const result=await invoke(transcript,{tools,reasoning_mode:reasoningModeForRequest(reasoningMode),response_mode:responseMode==='chunked'?'chunked':'stream',chunk_size:clamp(Number(chunkSize)||CONFIG.defaultChunkSize,32,4096),on_delta:onDelta});
+    let result=await invoke(transcript,{tools,reasoning_mode:reasoningModeForRequest(reasoningMode),response_mode:responseMode==='chunked'?'chunked':'stream',chunk_size:clamp(Number(chunkSize)||CONFIG.defaultChunkSize,32,4096),on_delta:onDelta});
     if(String(result?.reasoning||'').trim()&&typeof onReasoning==='function'){try{await onReasoning({text:String(result.reasoning),round,model:result.model||null,provider:result.node||result.endpoint||null,reasoning_style:result.reasoning_style||null})}catch(_){}}
-    const calls=normalizeToolCalls(result?.tool_calls||[]);if(!calls.length){transcript.push({role:'assistant',content:String(result?.text||'')});return {...result,tool_history:history,transcript,rounds:round+1}}
-    transcript.push({role:'assistant',content:result.text||null,tool_calls:calls});const batch=[];
-    for(const call of calls){const args=(()=>{try{return JSON.parse(call.function.arguments||'{}')}catch(_){return {raw:call.function.arguments||''}}})();const sig=commonsToolSig(call.function.name,args);const prior=history.slice(-16).find(x=>x.signature===sig&&x.ok);let exec;if(prior){exec={ok:false,tool:call.function.name,error:'exact duplicate/no-progress tool call blocked; use prior result or change the query/arguments',duplicate_of:prior.id||null}}else exec=await executeBrowserToolCall(call);const entry={name:call.function.name,id:call.id,args,signature:sig,...exec};entry.result_hash=commonsHashText(exec.ok?JSON.stringify(exec.output):String(exec.error||''));history.push(entry);batch.push(`${sig}:${entry.result_hash}`);if(typeof onTool==='function'){try{await onTool(entry)}catch(_){}}const content=commonsCompact(exec.ok?exec.output:{error:exec.error,ok:false,duplicate_of:exec.duplicate_of||null},30000);transcript.push({role:'tool',tool_call_id:call.id,name:call.function.name,content:typeof content==='string'?content:JSON.stringify(content)})}
+    let resultText=String(result?.text||''),calls=normalizeToolCalls(result?.tool_calls||[]);
+    /* Last-resort broker recovery: some models ignore both native function calling and the <tool_call> protocol and emit only {"query":...}. Recover that before treating it as final assistant text. */
+    if(!calls.length&&tools.length&&resultText.trim()){const recovered=extractFallbackToolCalls(resultText,tools);if(recovered.tool_calls.length){calls=recovered.tool_calls;resultText=recovered.text;result={...result,text:resultText,tool_calls:calls,tool_call_recovered:true}}}
+    if(!calls.length){transcript.push({role:'assistant',content:resultText});return {...result,text:resultText,tool_history:history,transcript,rounds:round+1}}
+    transcript.push({role:'assistant',content:resultText||null,tool_calls:calls});const batch=[];
+    for(const call of calls){const args=(()=>{const x=parseLooseToolJSON(call.function.arguments||'{}');return x&&typeof x==='object'?x:{raw:call.function.arguments||''}})();const sig=commonsToolSig(call.function.name,args);const prior=history.slice(-16).find(x=>x.signature===sig&&x.ok);let exec;if(prior){exec={ok:false,tool:call.function.name,error:'exact duplicate/no-progress tool call blocked; use prior result or change the query/arguments',duplicate_of:prior.id||null}}else exec=await executeBrowserToolCall(call);const entry={name:call.function.name,id:call.id,args,signature:sig,recovered:!!result?.tool_call_recovered,...exec};entry.result_hash=commonsHashText(exec.ok?JSON.stringify(exec.output):String(exec.error||''));history.push(entry);batch.push(`${sig}:${entry.result_hash}`);if(typeof onTool==='function'){try{await onTool(entry)}catch(_){}}const content=commonsCompact(exec.ok?exec.output:{error:exec.error,ok:false,duplicate_of:exec.duplicate_of||null},30000);transcript.push({role:'tool',tool_call_id:call.id,name:call.function.name,content:typeof content==='string'?content:JSON.stringify(content)})}
     const fp=batch.sort().join('|');if(fp===lastBatchFingerprint)repeatBatches++;else repeatBatches=0;lastBatchFingerprint=fp;if(repeatBatches>=1)throw new Error('tool chain made no progress: identical tool/result batch repeated');
   }
 };
@@ -6668,6 +6739,12 @@ window.addEventListener('oim:tool-result',e=>{const d=e.detail;if(d?.ok)commonsR
 const COMMONS_V2_SNAPSHOT=agentSnapshot;
 agentSnapshot=function(){const s=COMMONS_V2_SNAPSHOT();s.browser_harness={version:COMMONS_HARNESS_VERSION,tools_default_enabled:true,tool_round_limit:null,duplicate_no_progress_guard:true,context_scope:'chat session',context_expiry_after_leave_ms:null,peer_tool_rpc:{enabled:true,allowlist:[...COMMONS_PEER_SAFE_TOOLS],arbitrary_url_proxy:false},subagent:{text_only:true,isolated_context:true,max_delegation_depth:2},font:'Departure Mono'};s.web_search_fabric={version:WEB_FABRIC_VERSION,default_fanout:4,fusion:'reciprocal-rank-fusion',peer_fallback:true,lanes:Object.keys(WEB_FABRIC_PRIORITY),strict_keyless_excluded:['CORE API','Google Books API'],providers:Object.keys(WEB_FABRIC_PROVIDERS)};return s};
 window.COMMONS.harness={version:COMMONS_HARNESS_VERSION,listTools:()=>browserToolState(),enableAll:()=>{for(const n of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(n);state.toolsEnabled=true;state.toolMaxRounds=0;persistPolicy();renderBrowserTools();return browserToolState()},context:async()=>({session:commonsSessionId(),records:await commonsCtxAll()}),clearContext:()=>commonsCtxDeleteSession(),indexFile:commonsIndexFile,delegate:async(task,opts={})=>executeBrowserToolCall({function:{name:'delegate_subagent',arguments:JSON.stringify({task,...opts})}})};
+
+window.COMMONS.harness.parseToolText=(text)=>extractFallbackToolCalls(String(text||''),enabledBrowserToolDefinitions());
+window.COMMONS.harness.toolParserSelfTest=()=>[
+  'what events in portland happening today',
+  'Portland events September 4 2026'
+].map((q,i)=>{const sample=i?JSON.stringify({query:q,limit:5}):`I will search for events happening today.\n${JSON.stringify({query:'events in Portland',limit:5})}`;const parsed=extractFallbackToolCalls(sample,enabledBrowserToolDefinitions());return {sample,tool:parsed.tool_calls[0]?.function?.name||null,args:parsed.tool_calls[0]?parseLooseToolJSON(parsed.tool_calls[0].function.arguments):null,leftover:parsed.text}});
 
 
 /* ---------- boot ---------- */
