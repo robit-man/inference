@@ -7,7 +7,7 @@
 <meta name="description" content="Open Inference Mesh: a static-hostable, local-first peer-to-peer intelligence commons. People and agents can discover shared inference, use it within provider limits, and voluntarily contribute locally owned models so useful machine intelligence becomes broadly accessible rather than dependent on a single institution.">
 <meta name="robots" content="index,follow">
 <meta name="application-name" content="Open Inference Mesh">
-<meta name="oim-protocol" content="open-inference-mesh-v7.7">
+<meta name="oim-protocol" content="open-inference-commons-v7.7-harness3">
 <meta name="agent-interface" content="WebMCP, window.OIM, same-origin postMessage RPC, CustomEvent RPC">
 <link rel="help" href="?api=docs" title="Open Inference Mesh machine API documentation">
 <link rel="alternate" type="application/json" href="?api=docs" title="OIM agent API">
@@ -680,6 +680,9 @@ body{font-family:var(--wb-mono)!important}
   #promptInput{min-height:50px!important;padding:12px!important;font-size:11px!important}
 }
 
+@font-face{font-family:"Departure Mono";src:url("https://github.com/robit-man/departure/raw/refs/heads/main/DepartureMono-Regular.otf") format("opentype");font-style:normal;font-weight:400;font-display:swap}
+:root{--wb-mono:"Departure Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;--mono:"Departure Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;--sans:"Departure Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+
 </style>
 </head>
 <body>
@@ -1071,7 +1074,7 @@ console.log(r.text);</div>
         </div>
         <div class="agent-tool"><strong>Browser tool broker</strong><p>Inference models can call enabled tools through this browser. Remote compute nodes only generate tool calls; this requesting browser validates and executes them, then sends the result back for the next model turn.</p></div>
         <div class="agent-tool"><strong>Reasoning AUTO / ON / OFF</strong><p>Endpoint probing detects native reasoning controls where possible. AUTO preserves model defaults; ON/OFF apply compatible request-level overrides without blindly sending unsupported fields.</p></div>
-        <div class="agent-tool"><strong>Default tools</strong><p>Time, calculator, mesh/model state, a multi-source web-search megalith, current-news search, documentation/package/academic search, Wikipedia/Wikidata, GitHub, Stack Overflow, npm, Hugging Face, Crossref, Semantic Scholar, Open Library, GDELT, Open-Meteo, Hacker News, public_fetch and web_read. All built-in browser tools are enabled by default. public_fetch still blocks private/LAN targets.</p></div>
+        <div class="agent-tool"><strong>Default tools</strong><p>All browser-safe tools are enabled by default: federated web/current/docs/academic/package search, public data APIs, document retrieval, temporary session memory, evidence recall, privacy-redacted browser context, approximate location, and isolated sub-agent delegation. Fixed-source network tools may load-balance across signed peers; arbitrary URL reads remain requester-side and private/LAN targets remain blocked.</p></div>
         <div class="label">Agent interface state</div>
         <div id="agentStatus" class="statline"><span>WebMCP</span><span>detecting</span></div>
         <div class="label">Machine-readable snapshot</div>
@@ -2618,7 +2621,9 @@ async function joinOneRoom(strategy,logical,kind,shard){
     state:room.makeAction('oim-state'),
     grant:room.makeAction('oim-grant'),
     ping:room.makeAction('oim-ping'),
-    pex:room.makeAction('oim-pex')
+    pex:room.makeAction('oim-pex'),
+    toolreq:room.makeAction('oim-toolreq'),
+    toolres:room.makeAction('oim-toolres')
   };
   const wrapper={room,actions,key:fullKey,logical,strategy,kind,shard,name:rName,peers:new Set()};
   state.rooms.set(fullKey,wrapper);
@@ -2647,6 +2652,8 @@ async function joinOneRoom(strategy,logical,kind,shard){
   actions.state.onMessage=(data,meta)=>handleRemoteState(data,meta,wrapper);
   actions.grant.onMessage=(data,meta)=>handleIncomingGrant(data,meta,wrapper);
   actions.pex.onMessage=(data,meta)=>handlePeerExchange(data,meta,wrapper);
+  actions.toolreq.onMessage=(data,meta)=>handleRemoteBrowserToolRequest(data,meta,wrapper);
+  actions.toolres.onMessage=(data,meta)=>handleRemoteBrowserToolResult(data,meta,wrapper);
   actions.ping.onMessage=(data,meta)=>{
     upsertPeer(meta.peerId,{lastSeen:now(),online:true});
     if(data?.echo)actions.ping.send({nonce:data.nonce,reply:true,ts:now()},{target:meta.peerId}).catch(()=>{});
@@ -2910,7 +2917,7 @@ function setupNatsRtcRoute(pc,dc,remoteNode,sessionId,role){
     dc,pc,key,logical:sessionId,strategy:'nats-rtc',kind:'rendezvous',shard:-1,name:'nats-rendezvous',
     peers:new Set(),actions:{},remoteNode,sessionId
   };
-  for(const name of ['hello','infer','result','delta','state','grant','ping','pex'])wrapper.actions[name]=makeManualAction(wrapper,name);
+  for(const name of ['hello','infer','result','delta','state','grant','ping','pex','toolreq','toolres'])wrapper.actions[name]=makeManualAction(wrapper,name);
   state.rooms.set(key,wrapper);
   state.nats.rtcSessions.set(sessionId,{pc,dc,wrapper,remoteNode,role,created:now(),closed:false});
 
@@ -2921,6 +2928,8 @@ function setupNatsRtcRoute(pc,dc,remoteNode,sessionId,role){
   wrapper.actions.state.onMessage=(data,meta)=>handleRemoteState(data,meta,wrapper);
   wrapper.actions.grant.onMessage=(data,meta)=>handleIncomingGrant(data,meta,wrapper);
   wrapper.actions.pex.onMessage=(data,meta)=>handlePeerExchange(data,meta,wrapper);
+  wrapper.actions.toolreq.onMessage=(data,meta)=>handleRemoteBrowserToolRequest(data,meta,wrapper);
+  wrapper.actions.toolres.onMessage=(data,meta)=>handleRemoteBrowserToolResult(data,meta,wrapper);
   wrapper.actions.ping.onMessage=(data,meta)=>{
     upsertPeer(meta.peerId,{lastSeen:now(),online:true});
     if(data?.echo)wrapper.actions.ping.send({nonce:data.nonce,reply:true,ts:now()}).catch(()=>{});
@@ -3136,8 +3145,10 @@ function makeNknAction(wrapper,name){
 function getNknWrapper(addr){
   if(state.nknWrappers.has(addr))return state.nknWrappers.get(addr);
   const peerId=nknPeerId(addr),key=`nkn:${addr}`;const wrapper={key,logical:key,strategy:'nkn',kind:'overlay',shard:-1,name:'nkn-overlay',addr,peerId,peers:new Set([peerId]),actions:{},room:{leave:()=>{}}};
-  for(const name of ['hello','infer','result','delta','state','grant','ping','pex'])wrapper.actions[name]=makeNknAction(wrapper,name);
+  for(const name of ['hello','infer','result','delta','state','grant','ping','pex','toolreq','toolres'])wrapper.actions[name]=makeNknAction(wrapper,name);
   wrapper.actions.hello.onMessage=(data,meta)=>handleHello(data,meta,wrapper);wrapper.actions.infer.onMessage=(data,meta)=>handleRemoteInference(data,meta,wrapper);wrapper.actions.result.onMessage=(data,meta)=>handleInferenceResult(data,meta,wrapper);wrapper.actions.delta.onMessage=(data,meta)=>handleInferenceDelta(data,meta,wrapper);wrapper.actions.state.onMessage=(data,meta)=>handleRemoteState(data,meta,wrapper);wrapper.actions.grant.onMessage=(data,meta)=>handleIncomingGrant(data,meta,wrapper);wrapper.actions.pex.onMessage=(data,meta)=>handlePeerExchange(data,meta,wrapper);
+  wrapper.actions.toolreq.onMessage=(data,meta)=>handleRemoteBrowserToolRequest(data,meta,wrapper);
+  wrapper.actions.toolres.onMessage=(data,meta)=>handleRemoteBrowserToolResult(data,meta,wrapper);
   wrapper.actions.ping.onMessage=(data,meta)=>{upsertPeer(meta.peerId,{lastSeen:now(),online:true});if(data?.echo)wrapper.actions.ping.send({nonce:data.nonce,reply:true,ts:now()},{target:meta.peerId}).catch(()=>{})};state.nknWrappers.set(addr,wrapper);return wrapper;
 }
 async function handleNknPayload(src,payload){
@@ -3199,7 +3210,7 @@ function setupManualRoute(pc,dc,role='manual'){
     dc,pc,key,logical:routeId,strategy:'manual',kind:'manual',shard:-1,name:'manual-rendezvous',
     peers:new Set(),actions:{}
   };
-  for(const name of ['hello','infer','result','delta','state','grant','ping','pex'])wrapper.actions[name]=makeManualAction(wrapper,name);
+  for(const name of ['hello','infer','result','delta','state','grant','ping','pex','toolreq','toolres'])wrapper.actions[name]=makeManualAction(wrapper,name);
   state.rooms.set(key,wrapper);
 
   wrapper.actions.hello.onMessage=(data,meta)=>handleHello(data,meta,wrapper);
@@ -3209,6 +3220,8 @@ function setupManualRoute(pc,dc,role='manual'){
   wrapper.actions.state.onMessage=(data,meta)=>handleRemoteState(data,meta,wrapper);
   wrapper.actions.grant.onMessage=(data,meta)=>handleIncomingGrant(data,meta,wrapper);
   wrapper.actions.pex.onMessage=(data,meta)=>handlePeerExchange(data,meta,wrapper);
+  wrapper.actions.toolreq.onMessage=(data,meta)=>handleRemoteBrowserToolRequest(data,meta,wrapper);
+  wrapper.actions.toolres.onMessage=(data,meta)=>handleRemoteBrowserToolResult(data,meta,wrapper);
   wrapper.actions.ping.onMessage=(data,meta)=>{
     upsertPeer(meta.peerId,{lastSeen:now(),online:true});
     if(data?.echo)wrapper.actions.ping.send({nonce:data.nonce,reply:true,ts:now()}).catch(()=>{});
@@ -5883,12 +5896,190 @@ function updateMinimalWorkbenchStatus(){
 setInterval(updateMinimalWorkbenchStatus,1500);setTimeout(()=>{refreshModelSelect();commonsProbeAll();updateMinimalWorkbenchStatus();$('#promptInput')?.focus()},900);
 
 
+/* ========================================================================
+   COMMONS V3 · QWEN-OMNI-ADAPTERS BROWSER HARNESS EXTRACTION
+   Browser-only analogs of the repository's tool/context/delegation harness:
+   - all browser-safe tools default enabled
+   - unbounded tool chaining with duplicate/no-progress detection
+   - session-scoped document, web-evidence and temporary memory context
+   - isolated text-only sub-agent delegation
+   - distributed fixed-source keyless tool RPC across signed peers
+   - keyless public data/search federation; requester-side arbitrary URL reads
+   Media/GPU services are intentionally not imitated in-browser.
+   ======================================================================== */
+
+const COMMONS_HARNESS_VERSION='3.0-browser-omni-extract';
+const COMMONS_TOOL_PENDING=new Map();
+const COMMONS_TOOL_HEALTH=new Map();
+const COMMONS_TOOL_INGRESS=new Map();
+let COMMONS_REMOTE_TOOL_EXEC=false;
+let COMMONS_SUBAGENT_DEPTH=0;
+const COMMONS_PEER_SAFE_TOOLS=new Set([
+  'web_search','web_search_megalith','current_web_search','documentation_search','academic_search','package_search',
+  'duckduckgo_search','wikipedia_search','wikidata_search','github_search','stackexchange_search','crossref_search',
+  'hackernews_search','open_meteo_weather','europe_pmc_search','pubmed_search','datacite_search','internet_archive_search',
+  'google_books_search','huggingface_search','npm_search','pypi_search','packagist_search','rubygems_search','crates_search',
+  'nominatim_search','usgs_earthquakes','frankfurter_rates'
+]);
+const COMMONS_NETWORK_TOOLS=new Set(COMMONS_PEER_SAFE_TOOLS);
+const COMMONS_LOCAL_ONLY_TOOLS=new Set([
+  'oim_time','oim_calculate','oim_mesh_state','oim_list_models','get_capabilities','get_system_snapshot','get_user_location',
+  'session_context','memory_store','memory_search','memory_forget','document_list','document_search','document_read','web_evidence_recall',
+  'delegate_subagent','public_fetch','web_read'
+]);
+
+function commonsFnDef(name,description,properties={},required=[]){return {type:'function',function:{name,description,parameters:{type:'object',properties,required,additionalProperties:false}}}}
+function commonsTool(name,description,source,properties,required,execute){return {enabled:true,source,description,definition:commonsFnDef(name,description,properties,required),execute}}
+function commonsCompact(v,max=60000){const s=typeof v==='string'?v:JSON.stringify(v);return s.length>max?s.slice(0,max)+`\n[truncated ${s.length-max} chars]`:s}
+function commonsStripHtml(s){const d=new DOMParser().parseFromString(String(s||''),'text/html');return (d.body?.textContent||'').replace(/\s+/g,' ').trim()}
+function commonsToolSig(name,args){return `${name}:${JSON.stringify(args||{},Object.keys(args||{}).sort())}`}
+function commonsHashText(s){let h=2166136261;for(const ch of String(s||'')){h^=ch.charCodeAt(0);h=Math.imul(h,16777619)}return (h>>>0).toString(36)}
+
+/* ---------- Session context store ---------- */
+const COMMONS_CTX_DB='open-inference-commons-context-v3';
+const COMMONS_CTX_STORE='records';
+function commonsSessionId(){return String(state.chatSessionId||'default')}
+function commonsCtxDb(){return new Promise((resolve,reject)=>{const r=indexedDB.open(COMMONS_CTX_DB,1);r.onupgradeneeded=()=>{const db=r.result;if(!db.objectStoreNames.contains(COMMONS_CTX_STORE)){const st=db.createObjectStore(COMMONS_CTX_STORE,{keyPath:'id'});st.createIndex('session','session');st.createIndex('kind','kind');st.createIndex('expiresAt','expiresAt')}};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
+async function commonsCtxPut(rec){const db=await commonsCtxDb();return new Promise((resolve,reject)=>{const tx=db.transaction(COMMONS_CTX_STORE,'readwrite');tx.objectStore(COMMONS_CTX_STORE).put(rec);tx.oncomplete=()=>{db.close();resolve(rec)};tx.onerror=()=>{db.close();reject(tx.error)}})}
+async function commonsCtxAll(session=commonsSessionId(),kind=null){const db=await commonsCtxDb();return new Promise((resolve,reject)=>{const tx=db.transaction(COMMONS_CTX_STORE,'readonly'),st=tx.objectStore(COMMONS_CTX_STORE),req=st.index('session').getAll(session);req.onsuccess=()=>{db.close();resolve((req.result||[]).filter(x=>!kind||x.kind===kind))};req.onerror=()=>{db.close();reject(req.error)}})}
+async function commonsCtxDelete(id){const db=await commonsCtxDb();return new Promise((resolve,reject)=>{const tx=db.transaction(COMMONS_CTX_STORE,'readwrite');tx.objectStore(COMMONS_CTX_STORE).delete(id);tx.oncomplete=()=>{db.close();resolve(true)};tx.onerror=()=>{db.close();reject(tx.error)}})}
+async function commonsCtxDeleteSession(session=commonsSessionId()){const rows=await commonsCtxAll(session);await Promise.all(rows.map(x=>commonsCtxDelete(x.id)));return rows.length}
+async function commonsCtxExpireSession(session=commonsSessionId(),ttl=300000){const rows=await commonsCtxAll(session);const expiresAt=Date.now()+ttl;await Promise.all(rows.map(x=>commonsCtxPut({...x,expiresAt})));return rows.length}
+async function commonsCtxUnexpireSession(session=commonsSessionId()){const rows=await commonsCtxAll(session);await Promise.all(rows.map(x=>commonsCtxPut({...x,expiresAt:null})));return rows.length}
+async function commonsCtxCleanup(){const nowTs=Date.now();const db=await commonsCtxDb();return new Promise((resolve,reject)=>{const tx=db.transaction(COMMONS_CTX_STORE,'readwrite'),st=tx.objectStore(COMMONS_CTX_STORE),req=st.getAll();req.onsuccess=()=>{for(const x of req.result||[])if(x.expiresAt&&x.expiresAt<=nowTs)st.delete(x.id)};tx.oncomplete=()=>{db.close();resolve(true)};tx.onerror=()=>{db.close();reject(tx.error)}})}
+function commonsRankText(query,text){const qs=String(query||'').toLowerCase().split(/\W+/).filter(x=>x.length>1);const t=String(text||'').toLowerCase();let score=0;for(const q of qs){let p=0,c=0;while((p=t.indexOf(q,p))>=0&&c<10){score+=q.length*q.length;c++;p+=q.length}}return score}
+async function commonsSearchContext(kind,query,limit=8){const rows=await commonsCtxAll(commonsSessionId(),kind);return rows.map(x=>({x,score:commonsRankText(query,`${x.title||''}\n${x.text||''}\n${JSON.stringify(x.meta||{})}`)})).filter(r=>r.score>0||!query).sort((a,b)=>b.score-a.score||b.x.updatedAt-a.x.updatedAt).slice(0,limit).map(r=>({...r.x,score:r.score,text:commonsCompact(r.x.text||'',8000)}))}
+async function commonsRememberWebEvidence(tool,args,result){if(!COMMONS_NETWORK_TOOLS.has(tool)&&!['web_read','public_fetch'].includes(tool))return;const text=commonsCompact(result,18000);await commonsCtxPut({id:`ev_${crypto.randomUUID()}`,session:commonsSessionId(),kind:'evidence',title:`${tool} ${String(args?.query||args?.url||'').slice(0,180)}`,text,meta:{tool,args,authority:'external_public_tool',claim_limit:'tool result is external evidence, not visual perception'},createdAt:Date.now(),updatedAt:Date.now(),expiresAt:null}).catch(()=>{})}
+
+/* ---------- Browser document ingestion ---------- */
+async function commonsLoadScript(src,test){if(test?.())return;await new Promise((resolve,reject)=>{const x=document.createElement('script');x.src=src;x.crossOrigin='anonymous';x.onload=resolve;x.onerror=()=>reject(new Error(`failed to load ${src}`));document.head.append(x)});if(test&&!test())throw new Error(`library unavailable after ${src}`)}
+async function commonsExtractPdf(buf){const pdfjs=await import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs');pdfjs.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';const pdf=await pdfjs.getDocument({data:new Uint8Array(buf)}).promise;const parts=[];for(let i=1;i<=Math.min(pdf.numPages,500);i++){const pg=await pdf.getPage(i),tc=await pg.getTextContent();parts.push(`\n--- page ${i} ---\n`+tc.items.map(x=>x.str).join(' '));if(parts.join('').length>1000000)break}return parts.join('\n')}
+async function commonsExtractDocx(buf){await commonsLoadScript('https://cdn.jsdelivr.net/npm/mammoth@1.9.1/mammoth.browser.min.js',()=>!!window.mammoth);const r=await window.mammoth.extractRawText({arrayBuffer:buf});return r.value||''}
+async function commonsExtractFile(file){const name=file.name||'document',ext=(name.split('.').pop()||'').toLowerCase(),buf=await file.arrayBuffer();if(ext==='pdf'||file.type==='application/pdf')return commonsExtractPdf(buf);if(ext==='docx'||file.type==='application/vnd.openxmlformats-officedocument.wordprocessingml.document')return commonsExtractDocx(buf);let text=new TextDecoder('utf-8',{fatal:false}).decode(buf);if(['html','htm'].includes(ext)||file.type==='text/html')text=commonsStripHtml(text);return text}
+async function commonsIndexFile(file){let text=await commonsExtractFile(file);text=String(text||'').trim();if(!text)throw new Error(`${file.name}: no extractable text`);text=text.slice(0,1200000);const id=`doc_${crypto.randomUUID()}`;const rec={id,session:commonsSessionId(),kind:'document',title:file.name||'document',text,meta:{mime:file.type||'',size:file.size||0,authority:'user_attached_document'},createdAt:Date.now(),updatedAt:Date.now(),expiresAt:null};await commonsCtxPut(rec);return {id,title:rec.title,chars:text.length,mime:rec.meta.mime}}
+function commonsInstallDropIngestion(){const target=$('.composer')||document.body;if(!target||target.dataset.commonsDrop==='1')return;target.dataset.commonsDrop='1';target.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();target.classList.add('wb-drop')}});target.addEventListener('dragleave',()=>target.classList.remove('wb-drop'));target.addEventListener('drop',async e=>{const fs=[...(e.dataTransfer?.files||[])];if(!fs.length)return;e.preventDefault();target.classList.remove('wb-drop');for(const f of fs){try{const r=await commonsIndexFile(f);addMessage('system',`indexed ${r.title} · ${r.chars.toLocaleString()} chars`,'context')}catch(err){addMessage('system',`document failed: ${err.message}`,'context')}}});document.addEventListener('paste',async e=>{const fs=[...(e.clipboardData?.files||[])];for(const f of fs){try{const r=await commonsIndexFile(f);addMessage('system',`indexed ${r.title} · ${r.chars.toLocaleString()} chars`,'context')}catch(_){}}})}
+
+/* ---------- Keyless fixed-source tools ---------- */
+async function commonsJson(url,timeout=16000){return fetchToolJson(url,timeout)}
+async function commonsEuropePmc(q,limit=8){const d=await commonsJson(`https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(q)}&format=json&pageSize=${limit}`);return (d.resultList?.result||[]).map(x=>({source:'europe_pmc',title:x.title,url:x.pmcid?`https://europepmc.org/articles/${x.pmcid}`:x.doi?`https://doi.org/${x.doi}`:null,snippet:[x.authorString,x.journalTitle,x.pubYear].filter(Boolean).join(' · '),doi:x.doi||null,pmid:x.pmid||null}))}
+async function commonsPubmed(q,limit=8){const a=await commonsJson(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax=${limit}&term=${encodeURIComponent(q)}`);const ids=a.esearchresult?.idlist||[];if(!ids.length)return[];const b=await commonsJson(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&retmode=json&id=${ids.join(',')}`);return ids.map(id=>{const x=b.result?.[id]||{};return {source:'pubmed',title:x.title||id,url:`https://pubmed.ncbi.nlm.nih.gov/${id}/`,snippet:[(x.authors||[]).slice(0,3).map(a=>a.name).join(', '),x.fulljournalname,x.pubdate].filter(Boolean).join(' · '),pmid:id}})}
+async function commonsDatacite(q,limit=8){const d=await commonsJson(`https://api.datacite.org/dois?query=${encodeURIComponent(q)}&page[size]=${limit}`);return (d.data||[]).map(x=>({source:'datacite',title:(x.attributes?.titles||[])[0]?.title||x.id,url:x.attributes?.url||`https://doi.org/${x.id}`,snippet:[x.attributes?.publisher,x.attributes?.publicationYear,x.id].filter(Boolean).join(' · '),doi:x.id}))}
+async function commonsInternetArchive(q,limit=8){const fields=['identifier','title','description','creator','date','mediatype'].map(x=>`fl[]=${x}`).join('&');const d=await commonsJson(`https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&${fields}&rows=${limit}&page=1&output=json`);return (d.response?.docs||[]).map(x=>({source:'internet_archive',title:x.title||x.identifier,url:`https://archive.org/details/${encodeURIComponent(x.identifier)}`,snippet:[Array.isArray(x.creator)?x.creator.join(', '):x.creator,x.date,x.mediatype,Array.isArray(x.description)?x.description[0]:x.description].filter(Boolean).join(' · ').slice(0,500)}))}
+async function commonsGoogleBooks(q,limit=8){const d=await commonsJson(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${Math.min(limit,10)}`);return (d.items||[]).map(x=>({source:'google_books',title:x.volumeInfo?.title||x.id,url:x.volumeInfo?.infoLink||null,snippet:[(x.volumeInfo?.authors||[]).join(', '),x.volumeInfo?.publishedDate,x.volumeInfo?.description].filter(Boolean).join(' · ').slice(0,600)}))}
+async function commonsHf(q,limit=8){const d=await commonsJson(`https://huggingface.co/api/models?search=${encodeURIComponent(q)}&limit=${limit}&sort=downloads&direction=-1`);return (Array.isArray(d)?d:[]).map(x=>({source:'huggingface',title:x.modelId||x.id,url:`https://huggingface.co/${x.modelId||x.id}`,snippet:[x.pipeline_tag,`${x.downloads||0} downloads`,(x.tags||[]).slice(0,5).join(', ')].filter(Boolean).join(' · ')}))}
+async function commonsPypi(q,limit=8){const html=await webReadPublic(`https://pypi.org/search/?q=${encodeURIComponent(q)}`,20000);const text=String(html?.text||html?.content||html||'');const hits=[...text.matchAll(/package-snippet[^>]*>[\s\S]*?package-snippet__name[^>]*>([^<]+)[\s\S]*?package-snippet__version[^>]*>([^<]+)[\s\S]*?package-snippet__description[^>]*>([^<]*)/gi)].slice(0,limit);if(hits.length)return hits.map(m=>({source:'pypi',title:m[1].trim(),url:`https://pypi.org/project/${encodeURIComponent(m[1].trim())}/`,snippet:`${m[2].trim()} · ${m[3].trim()}`}));return [{source:'pypi',title:'PyPI search',url:`https://pypi.org/search/?q=${encodeURIComponent(q)}`,snippet:text.slice(0,1200)}]}
+async function commonsPackagist(q,limit=8){const d=await commonsJson(`https://packagist.org/search.json?q=${encodeURIComponent(q)}&per_page=${limit}`);return (d.results||[]).slice(0,limit).map(x=>({source:'packagist',title:x.name,url:x.url||`https://packagist.org/packages/${x.name}`,snippet:x.description||'',downloads:x.downloads||0,favers:x.favers||0}))}
+async function commonsRubygems(q,limit=8){const d=await commonsJson(`https://rubygems.org/api/v1/search.json?query=${encodeURIComponent(q)}`);return (Array.isArray(d)?d:[]).slice(0,limit).map(x=>({source:'rubygems',title:x.name,url:x.project_uri||x.gem_uri||null,snippet:[x.info,x.version,`${x.downloads||0} downloads`].filter(Boolean).join(' · ').slice(0,600)}))}
+async function commonsCrates(q,limit=8){const d=await commonsJson(`https://crates.io/api/v1/crates?q=${encodeURIComponent(q)}&per_page=${limit}&page=1&sort=relevance`);return (d.crates||[]).map(x=>({source:'crates',title:x.id,url:`https://crates.io/crates/${x.id}`,snippet:[x.description,x.newest_version,`${x.downloads||0} downloads`].filter(Boolean).join(' · ').slice(0,600)}))}
+async function commonsNominatim(q,limit=6){const d=await commonsJson(`https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}&limit=${limit}&addressdetails=1`);return (Array.isArray(d)?d:[]).map(x=>({source:'openstreetmap_nominatim',title:x.display_name,url:`https://www.openstreetmap.org/?mlat=${x.lat}&mlon=${x.lon}#map=14/${x.lat}/${x.lon}`,lat:Number(x.lat),lon:Number(x.lon),type:x.type,importance:x.importance}))}
+async function commonsEarthquakes({start_time,end_time,min_magnitude=2.5,limit=50}={}){const end=end_time||new Date().toISOString().slice(0,10),start=start_time||new Date(Date.now()-7*86400000).toISOString().slice(0,10);return commonsJson(`https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=${encodeURIComponent(start)}&endtime=${encodeURIComponent(end)}&minmagnitude=${encodeURIComponent(min_magnitude)}&limit=${Math.min(Number(limit)||50,200)}&orderby=time`)}
+async function commonsFx({from='USD',to='EUR',amount=1,date='latest'}={}){
+  from=String(from||'USD').toUpperCase();to=String(to||'EUR').toUpperCase();amount=Number(amount)||1;
+  let row;
+  if(date&&date!=='latest'){
+    const rows=await commonsJson(`https://api.frankfurter.dev/v2/rates?base=${encodeURIComponent(from)}&quotes=${encodeURIComponent(to)}&date=${encodeURIComponent(date)}`);
+    row=Array.isArray(rows)?(rows.find(x=>String(x.quote||'').toUpperCase()===to)||rows[0]):rows;
+  }else row=await commonsJson(`https://api.frankfurter.dev/v2/rate/${encodeURIComponent(from)}/${encodeURIComponent(to)}`);
+  const rate=Number(row?.rate);if(!Number.isFinite(rate))throw new Error('Frankfurter returned no usable rate');
+  return {date:row?.date||date,base:row?.base||from,quote:row?.quote||to,rate,amount,converted:amount*rate,source:'frankfurter.dev'}
+}
+async function commonsApproxLocation(){const sources=['https://ipwho.is/','https://ipapi.co/json/'];let last;for(const u of sources){try{const d=await commonsJson(u,9000);if(d&&d.success!==false){return {city:d.city||null,region:d.region||d.region_name||null,country:d.country||d.country_name||null,country_code:d.country_code||null,latitude:Number(d.latitude)||null,longitude:Number(d.longitude)||null,timezone:typeof d.timezone==='string'?d.timezone:d.timezone?.id||null,accuracy:'approximate network-derived session geography',authority:new URL(u).hostname,privacy:'raw IP/network identifiers discarded before tool result'}}}catch(e){last=e}}throw last||new Error('location providers unavailable')}
+async function commonsSystemSnapshot(){let storage=null;try{storage=await navigator.storage?.estimate?.()}catch(_){}return {timestamp:new Date().toISOString(),timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||null,platform:navigator.userAgentData?.platform||navigator.platform||null,mobile:navigator.userAgentData?.mobile??null,languages:navigator.languages||[],hardware_concurrency:navigator.hardwareConcurrency||null,device_memory_gb:navigator.deviceMemory||null,network:navigator.connection?{effective_type:navigator.connection.effectiveType,downlink_mbps:navigator.connection.downlink,rtt_ms:navigator.connection.rtt,save_data:navigator.connection.saveData}:null,viewport:{width:innerWidth,height:innerHeight,dpr:devicePixelRatio||1},storage:storage?{quota:storage.quota,usage:storage.usage}:null,secure_context:isSecureContext,online:navigator.onLine,scope:'requesting browser only',excluded:['hostname','IP address','routes','sockets','process list','credentials','session content']}}
+
+Object.assign(BUILTIN_BROWSER_TOOLS,{
+  get_capabilities:commonsTool('get_capabilities','Report current browser, context, mesh, inference and tool capabilities without secrets.','local',{},[],async()=>({harness:COMMONS_HARNESS_VERSION,modalities:{text:true,attachments:'text/pdf/docx/html/json/csv/markdown via browser extraction',native_media_inference:false},tools:browserToolState(),mesh:agentSnapshot(),context:{session:commonsSessionId(),records:(await commonsCtxAll()).length},notes:['GPU audio/video/TTS execution remains optional adapter/local-endpoint capability; this browser harness does not fake it.']})),
+  get_system_snapshot:commonsTool('get_system_snapshot','Sample a privacy-redacted snapshot of the requesting browser/device runtime.','local browser',{},[],commonsSystemSnapshot),
+  get_user_location:commonsTool('get_user_location','Get sanitized approximate session geography from keyless HTTPS providers. Raw IP is discarded.','ipwho.is → ipapi.co',{},[],commonsApproxLocation),
+  session_context:commonsTool('session_context','Summarize current session context inventory: transcript, documents, temporary memory and retained web evidence.','IndexedDB session scope',{},[],async()=>{const rows=await commonsCtxAll();return {session:commonsSessionId(),chat_messages:state.chatSession?.transcript?.length||0,documents:rows.filter(x=>x.kind==='document').map(x=>({id:x.id,title:x.title,chars:(x.text||'').length})),memory:rows.filter(x=>x.kind==='memory').map(x=>({id:x.id,title:x.title})),web_evidence:rows.filter(x=>x.kind==='evidence').slice(-20).map(x=>({id:x.id,title:x.title,tool:x.meta?.tool}))}}),
+  memory_store:commonsTool('memory_store','Store explicit temporary session memory. It is scoped to this chat and expires after the browser has been away for five minutes.','IndexedDB session memory',{text:{type:'string'},title:{type:'string'}},['text'],async a=>{const rec={id:`mem_${crypto.randomUUID()}`,session:commonsSessionId(),kind:'memory',title:String(a.title||'memory').slice(0,160),text:String(a.text||'').slice(0,50000),meta:{authority:'explicit_session_memory'},createdAt:Date.now(),updatedAt:Date.now(),expiresAt:null};await commonsCtxPut(rec);return {id:rec.id,title:rec.title,stored_chars:rec.text.length}}),
+  memory_search:commonsTool('memory_search','Recall relevant explicit temporary session memories.','IndexedDB session memory',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsSearchContext('memory',a.query,clamp(Number(a.limit)||6,1,20))),
+  memory_forget:commonsTool('memory_forget','Delete one temporary session memory by id, or clear all memories when id is omitted.','IndexedDB session memory',{id:{type:'string'}},[],async a=>{if(a.id){await commonsCtxDelete(String(a.id));return {deleted:String(a.id)}}const rows=await commonsCtxAll(commonsSessionId(),'memory');await Promise.all(rows.map(x=>commonsCtxDelete(x.id)));return {deleted:rows.length}}),
+  document_list:commonsTool('document_list','List documents dragged/pasted into this browser session.','IndexedDB document context',{},[],async()=>{const r=await commonsCtxAll(commonsSessionId(),'document');return r.map(x=>({id:x.id,title:x.title,chars:(x.text||'').length,mime:x.meta?.mime||''}))}),
+  document_search:commonsTool('document_search','Search session-isolated extracted document text.','IndexedDB document context',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsSearchContext('document',a.query,clamp(Number(a.limit)||8,1,20))),
+  document_read:commonsTool('document_read','Read a bounded range from one indexed document.','IndexedDB document context',{id:{type:'string'},start:{type:'integer',minimum:0},max_chars:{type:'integer',minimum:256,maximum:50000}},['id'],async a=>{const rows=await commonsCtxAll(commonsSessionId(),'document'),d=rows.find(x=>x.id===a.id);if(!d)throw new Error('document not found in current session');const st=Math.max(0,Number(a.start)||0),n=clamp(Number(a.max_chars)||12000,256,50000);return {id:d.id,title:d.title,start:st,end:Math.min((d.text||'').length,st+n),total_chars:(d.text||'').length,text:(d.text||'').slice(st,st+n)}}),
+  web_evidence_recall:commonsTool('web_evidence_recall','Search prior public-web tool evidence from this session without repeating the network request.','IndexedDB web evidence',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsSearchContext('evidence',a.query,clamp(Number(a.limit)||8,1,20))),
+  delegate_subagent:commonsTool('delegate_subagent','Run an isolated text-only sub-agent on the same inference fabric. It receives only the supplied task/context, has browser tools, and returns a compact result to the parent.','isolated inference fabric',{task:{type:'string'},role:{type:'string'},context:{type:'string'},model:{type:'string'},route:{type:'string',enum:['auto','local','mesh']}},['task'],async a=>{if(COMMONS_SUBAGENT_DEPTH>=2)throw new Error('sub-agent delegation depth limit reached');COMMONS_SUBAGENT_DEPTH++;try{const role=String(a.role||'research sub-agent').slice(0,200),context=String(a.context||'').slice(0,30000),prompt=`You are an isolated ${role}. Complete the delegated task independently. Use tools when useful. Return only the result needed by the parent. Do not assume access to the parent conversation beyond EXPLICIT CONTEXT.\n\nTASK:\n${String(a.task||'').slice(0,50000)}${context?`\n\nEXPLICIT CONTEXT:\n${context}`:''}`;const r=await agentRunInference({prompt,model:a.model||null,route:['auto','local','mesh'].includes(a.route)?a.route:'auto',tools:true,reasoning:'auto',max_tokens:4096});return {text:r.text,model:r.model,route:r.route,tools_used:(r.tools_used||[]).map(x=>x.name),latency_ms:r.latency_ms}}finally{COMMONS_SUBAGENT_DEPTH--}}),
+  europe_pmc_search:commonsTool('europe_pmc_search','Search Europe PMC biomedical literature without an API key.','Europe PMC REST',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsEuropePmc(a.query,clamp(Number(a.limit)||8,1,20))),
+  pubmed_search:commonsTool('pubmed_search','Search PubMed through NCBI E-utilities without a key at public rate limits.','NCBI E-utilities',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsPubmed(a.query,clamp(Number(a.limit)||8,1,20))),
+  datacite_search:commonsTool('datacite_search','Search DataCite DOI metadata without a key.','DataCite REST',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsDatacite(a.query,clamp(Number(a.limit)||8,1,20))),
+  internet_archive_search:commonsTool('internet_archive_search','Search Internet Archive metadata without a key.','Internet Archive Advanced Search',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsInternetArchive(a.query,clamp(Number(a.limit)||8,1,20))),
+  google_books_search:commonsTool('google_books_search','Search public Google Books metadata without a user key.','Google Books public API',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:10}},['query'],a=>commonsGoogleBooks(a.query,clamp(Number(a.limit)||8,1,10))),
+  huggingface_search:commonsTool('huggingface_search','Search public Hugging Face models without authentication.','Hugging Face Hub public API',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsHf(a.query,clamp(Number(a.limit)||8,1,20))),
+  npm_search:commonsTool('npm_search','Search npm packages using the public registry search endpoint.','npm registry',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>searchNpm(a.query,clamp(Number(a.limit)||8,1,20))),
+  pypi_search:commonsTool('pypi_search','Search Python packages through public PyPI pages/keyless retrieval.','PyPI public web',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsPypi(a.query,clamp(Number(a.limit)||8,1,20))),
+  packagist_search:commonsTool('packagist_search','Search Composer/Packagist packages without a key.','Packagist API',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsPackagist(a.query,clamp(Number(a.limit)||8,1,20))),
+  rubygems_search:commonsTool('rubygems_search','Search RubyGems packages without a key.','RubyGems API',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsRubygems(a.query,clamp(Number(a.limit)||8,1,20))),
+  crates_search:commonsTool('crates_search','Search crates.io Rust packages without a key.','crates.io API',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:20}},['query'],a=>commonsCrates(a.query,clamp(Number(a.limit)||8,1,20))),
+  nominatim_search:commonsTool('nominatim_search','Geocode/search named places using the public OpenStreetMap Nominatim service.','OpenStreetMap Nominatim',{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:10}},['query'],a=>commonsNominatim(a.query,clamp(Number(a.limit)||6,1,10))),
+  usgs_earthquakes:commonsTool('usgs_earthquakes','Query recent earthquake events from the USGS FDSN GeoJSON API.','USGS',{start_time:{type:'string'},end_time:{type:'string'},min_magnitude:{type:'number'},limit:{type:'integer',minimum:1,maximum:200}},[],commonsEarthquakes),
+  frankfurter_rates:commonsTool('frankfurter_rates','Get reference FX conversion/rates from the keyless Frankfurter API.','Frankfurter',{from:{type:'string'},to:{type:'string'},amount:{type:'number'},date:{type:'string'}},[],commonsFx)
+});
+
+/* Expand the existing megalith with additional independent public indexes. */
+const COMMONS_V77_MEGALITH=megalithWebSearch;
+megalithWebSearch=async function(query,{mode='broad',limit=15}={}){
+  const basePromise=COMMONS_V77_MEGALITH(query,{mode,limit});
+  const extras=[];
+  if(['broad','academic'].includes(mode))extras.push(['europe_pmc',()=>commonsEuropePmc(query,5)],['datacite',()=>commonsDatacite(query,5)],['internet_archive',()=>commonsInternetArchive(query,5)],['google_books',()=>commonsGoogleBooks(query,5)]);
+  if(['broad','docs','code'].includes(mode))extras.push(['huggingface',()=>commonsHf(query,5)],['packagist',()=>commonsPackagist(query,5)],['rubygems',()=>commonsRubygems(query,5)],['crates',()=>commonsCrates(query,5)]);
+  const settled=await Promise.allSettled([basePromise,...extras.map(x=>x[1]())]);let base={results:[],failures:[]};if(settled[0].status==='fulfilled')base=settled[0].value||base;else base.failures=[...(base.failures||[]),{source:'v7.7-base',error:String(settled[0].reason)}];const all=[...(base.results||[])],fail=[...(base.failures||[])];for(let i=1;i<settled.length;i++){const name=extras[i-1][0],r=settled[i];if(r.status==='fulfilled')all.push(...(r.value||[]));else fail.push({source:name,error:String(r.reason?.message||r.reason)})}const seen=new Set(),dedup=[];for(const x of all){const k=(x.url||x.title||JSON.stringify(x)).toLowerCase();if(seen.has(k))continue;seen.add(k);dedup.push(x);if(dedup.length>=limit)break}return {...base,query,mode,results:dedup,failures:fail,sources_attempted:(base.sources_attempted||0)+extras.length,sources_succeeded:(base.sources_succeeded||0)+extras.length-fail.filter(x=>extras.some(e=>e[0]===x.source)).length}
+};
+
+/* ---------- Distributed fixed-source tool RPC ---------- */
+function commonsIngressAllowed(node){const k=String(node||'unknown'),cut=Date.now()-60000,arr=(COMMONS_TOOL_INGRESS.get(k)||[]).filter(t=>t>cut);if(arr.length>=30)return false;arr.push(Date.now());COMMONS_TOOL_INGRESS.set(k,arr);return true}
+function commonsAdvertisedTools(){return [...COMMONS_PEER_SAFE_TOOLS].filter(n=>state.toolsEnabled&&state.enabledBrowserTools.has(n)&&browserToolCatalog()[n])}
+function commonsPeerToolCandidates(name){const byNode=new Map();for(const p of state.peers.values()){if(!p.online||!p.verified||!p.node||state.peerDenied.has(p.node))continue;const tools=p.advertisement?.browserTools||p.advertisement?.browser_tools||[];if(!Array.isArray(tools)||!tools.includes(name))continue;const old=byNode.get(p.node);if(!old||Number(p.tps||0)>Number(old.tps||0))byNode.set(p.node,p)}return [...byNode.values()].map(p=>{const h=COMMONS_TOOL_HEALTH.get(`${p.node}:${name}`)||{};let score=100+(Number(p.capacity)||1)*4-(Number(p.load)||0)*20-(Number(p.queue)||0)*5+(Number(p.tps)||0);if(h.ok)score+=80;if(h.latency)score-=Math.min(80,h.latency/100);if(h.failUntil>Date.now())score-=1000;score+=Math.random()*20;return {p,score}}).sort((a,b)=>b.score-a.score)}
+async function commonsCallPeerTool(peer,name,args){const routeIds=routesForNode(peer.node);let last;for(const routeId of routeIds){const w=roomForPeer(routeId);if(!w?.actions?.toolreq||!w?.actions?.toolres)continue;const id=`tool_${crypto.randomUUID()}`,t0=performance.now();try{const result=await new Promise(async(resolve,reject)=>{const timer=setTimeout(()=>{COMMONS_TOOL_PENDING.delete(id);reject(new Error('peer tool timed out'))},25000);COMMONS_TOOL_PENDING.set(id,{resolve,reject,timer,node:peer.node,name});try{await w.actions.toolreq.send({id,name,args,ts:Date.now()},{target:routeId})}catch(e){clearTimeout(timer);COMMONS_TOOL_PENDING.delete(id);reject(e)}});COMMONS_TOOL_HEALTH.set(`${peer.node}:${name}`,{ok:true,latency:Math.round(performance.now()-t0),lastSuccess:Date.now()});return {...result,peer_node:peer.node,peer_route:routeId}}catch(e){last=e;COMMONS_TOOL_HEALTH.set(`${peer.node}:${name}`,{ok:false,failUntil:Date.now()+15000,lastError:String(e.message||e)})}}throw last||new Error('no connected peer tool route')}
+async function handleRemoteBrowserToolRequest(data,meta,wrapper){const peer=state.peers.get(meta.peerId);if(!peer?.verified||!peer.node||!commonsIngressAllowed(peer.node))return;if(!data?.id||!COMMONS_PEER_SAFE_TOOLS.has(String(data.name||'')))return;const name=String(data.name),args=(data.args&&typeof data.args==='object')?data.args:{};if(JSON.stringify(args).length>20000)return;const t0=performance.now();const prev=COMMONS_REMOTE_TOOL_EXEC;COMMONS_REMOTE_TOOL_EXEC=true;let result;try{result=await OIM77_EXECUTE_BROWSER_TOOL({id:data.id,function:{name,arguments:JSON.stringify(args)}});if(result.ok)await commonsRememberWebEvidence(name,args,result.output)}catch(e){result={ok:false,tool:name,error:String(e.message||e)}}finally{COMMONS_REMOTE_TOOL_EXEC=prev}const wire=(()=>{if(!result.ok)return undefined;if(typeof result.output==='string')return result.output.slice(0,70000);try{const raw=JSON.stringify(result.output);return raw.length<=70000?result.output:{truncated:true,text:raw.slice(0,70000)}}catch(_){return String(result.output).slice(0,70000)}})();const payload={id:data.id,name,ok:!!result.ok,output:wire,error:result.ok?undefined:String(result.error||'tool failed'),duration_ms:Math.round(performance.now()-t0),node:state.nodeId};wrapper.actions.toolres.send(payload,{target:meta.peerId}).catch(()=>{})}
+function handleRemoteBrowserToolResult(data,meta){if(!data?.id)return;const p=COMMONS_TOOL_PENDING.get(data.id);if(!p)return;clearTimeout(p.timer);COMMONS_TOOL_PENDING.delete(data.id);if(data.ok)p.resolve({ok:true,tool:data.name,output:data.output,duration_ms:data.duration_ms,node:data.node});else p.reject(new Error(data.error||'peer tool failed'))}
+
+const OIM77_EXECUTE_BROWSER_TOOL=executeBrowserToolCall;
+executeBrowserToolCall=async function(call){
+  const name=String(call?.function?.name||call?.name||''),raw=call?.function?.arguments??call?.arguments??{};let args={};try{args=typeof raw==='string'?(raw.trim()?JSON.parse(raw):{}):(raw||{})}catch(_){args={}}
+  if(COMMONS_REMOTE_TOOL_EXEC||COMMONS_LOCAL_ONLY_TOOLS.has(name)||!COMMONS_PEER_SAFE_TOOLS.has(name)){
+    const r=await OIM77_EXECUTE_BROWSER_TOOL(call);if(r.ok)await commonsRememberWebEvidence(name,args,r.output);return r;
+  }
+  /* Balanced egress: local browser plus signed peers advertising this exact fixed-source tool. */
+  const peers=commonsPeerToolCandidates(name);const choices=[{kind:'local',score:120+Math.random()*30},...peers.slice(0,4).map(x=>({kind:'peer',score:x.score,peer:x.p}))].sort((a,b)=>b.score-a.score);let last;
+  for(const c of choices){try{let r;if(c.kind==='local')r=await OIM77_EXECUTE_BROWSER_TOOL(call);else r=await commonsCallPeerTool(c.peer,name,args);if(r?.ok){await commonsRememberWebEvidence(name,args,r.output);return {...r,egress:c.kind==='local'?'local':`peer:${c.peer.node}`}}last=new Error(r?.error||'tool failed')}catch(e){last=e}}
+  return {ok:false,tool:name,error:String(last?.message||last||'all local/peer tool routes failed')};
+};
+
+/* Extend advertisements with a tool capability vector; no credentials or context. */
+const COMMONS_V2_GET_CAPS=getCapabilities;
+getCapabilities=async function(){const body=await COMMONS_V2_GET_CAPS();body.browserTools=commonsAdvertisedTools();body.harness=COMMONS_HARNESS_VERSION;const {adSig,...unsigned}=body;delete unsigned.sig;body.adSig=await signObject(unsigned);return body};
+
+/* ---------- Qwen-style unbounded chaining + exact duplicate/no-progress guard ---------- */
+runBrowserToolLoop=async function({messages,invoke,onDelta=null,onTool=null,useTools=true,reasoningMode=state.reasoningMode,responseMode=state.responseMode,chunkSize=state.responseChunkSize,maxRounds=0}={}){
+  const transcript=sanitizeInferenceMessages(messages,''),tools=useTools&&state.toolsEnabled?enabledBrowserToolDefinitions():[],history=[];let lastBatchFingerprint='',repeatBatches=0;
+  for(let round=0;;round++){
+    const result=await invoke(transcript,{tools,reasoning_mode:reasoningModeForRequest(reasoningMode),response_mode:responseMode==='chunked'?'chunked':'stream',chunk_size:clamp(Number(chunkSize)||CONFIG.defaultChunkSize,32,4096),on_delta:onDelta});
+    const calls=normalizeToolCalls(result?.tool_calls||[]);if(!calls.length){transcript.push({role:'assistant',content:String(result?.text||'')});return {...result,tool_history:history,transcript,rounds:round+1}}
+    transcript.push({role:'assistant',content:result.text||null,tool_calls:calls});const batch=[];
+    for(const call of calls){const args=(()=>{try{return JSON.parse(call.function.arguments||'{}')}catch(_){return {raw:call.function.arguments||''}}})();const sig=commonsToolSig(call.function.name,args);const prior=history.slice(-16).find(x=>x.signature===sig&&x.ok);let exec;if(prior){exec={ok:false,tool:call.function.name,error:'exact duplicate/no-progress tool call blocked; use prior result or change the query/arguments',duplicate_of:prior.id||null}}else exec=await executeBrowserToolCall(call);const entry={name:call.function.name,id:call.id,args,signature:sig,...exec};entry.result_hash=commonsHashText(exec.ok?JSON.stringify(exec.output):String(exec.error||''));history.push(entry);batch.push(`${sig}:${entry.result_hash}`);if(typeof onTool==='function'){try{await onTool(entry)}catch(_){}}const content=commonsCompact(exec.ok?exec.output:{error:exec.error,ok:false,duplicate_of:exec.duplicate_of||null},30000);transcript.push({role:'tool',tool_call_id:call.id,name:call.function.name,content:typeof content==='string'?content:JSON.stringify(content)})}
+    const fp=batch.sort().join('|');if(fp===lastBatchFingerprint)repeatBatches++;else repeatBatches=0;lastBatchFingerprint=fp;if(repeatBatches>=1)throw new Error('tool chain made no progress: identical tool/result batch repeated');
+  }
+};
+
+function enableCommonsToolsDefault(){const key='commons.omniHarnessDefaults.v3';if(localStorage.getItem(key)==='1')return;for(const name of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(name);state.toolsEnabled=true;state.toolMaxRounds=0;localStorage.setItem(key,'1');persistPolicy()}
+function commonsInstallContextSettings(){const root=$('#leftSidebar');if(!root||$('#commonsContextPanel'))return;const sec=document.createElement('section');sec.className='section side-section';sec.id='commonsContextPanel';sec.innerHTML=`<details class="side-collapse"><summary><span class="side-title">Context / harness</span></summary><div class="side-section-body"><div class="mini">Qwen Omni browser harness · all tools default on · unbounded chaining + duplicate guard · drag/drop or paste PDF, DOCX, text, HTML, JSON, CSV, Markdown into the composer.</div><div class="row" style="margin-top:8px"><button class="btn small" id="commonsContextClear">clear session context</button><button class="btn small" id="commonsToolsAll">enable all tools</button></div><div class="mini" id="commonsContextStats" style="margin-top:7px">context loading</div></div></details>`;root.append(sec);$('#commonsContextClear').onclick=async()=>{$('#commonsContextStats').textContent=`cleared ${await commonsCtxDeleteSession()} context records`};$('#commonsToolsAll').onclick=()=>{for(const n of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(n);state.toolsEnabled=true;state.toolMaxRounds=0;persistPolicy();renderBrowserTools();$('#commonsContextStats').textContent=`${state.enabledBrowserTools.size} tools enabled`};setInterval(async()=>{const el=$('#commonsContextStats');if(!el)return;const rows=await commonsCtxAll().catch(()=>[]);el.textContent=`${state.enabledBrowserTools.size} tools · ${rows.filter(x=>x.kind==='document').length} docs · ${rows.filter(x=>x.kind==='memory').length} memory · ${rows.filter(x=>x.kind==='evidence').length} evidence`},2500)}
+
+window.addEventListener('pageshow',()=>{commonsCtxCleanup().then(()=>commonsCtxUnexpireSession()).catch(()=>{})});window.addEventListener('pagehide',()=>{commonsCtxExpireSession().catch(()=>{})});
+
+/* Machine interface additions. */
+window.addEventListener('oim:tool-result',e=>{const d=e.detail;if(d?.ok)commonsRememberWebEvidence(d.tool,{},d.output).catch(()=>{})});
+const COMMONS_V2_SNAPSHOT=agentSnapshot;
+agentSnapshot=function(){const s=COMMONS_V2_SNAPSHOT();s.browser_harness={version:COMMONS_HARNESS_VERSION,tools_default_enabled:true,tool_round_limit:null,duplicate_no_progress_guard:true,context_scope:'chat session',context_expiry_after_leave_ms:300000,peer_tool_rpc:{enabled:true,allowlist:[...COMMONS_PEER_SAFE_TOOLS],arbitrary_url_proxy:false},subagent:{text_only:true,isolated_context:true,max_delegation_depth:2},font:'Departure Mono'};return s};
+window.COMMONS.harness={version:COMMONS_HARNESS_VERSION,listTools:()=>browserToolState(),enableAll:()=>{for(const n of Object.keys(browserToolCatalog()))state.enabledBrowserTools.add(n);state.toolsEnabled=true;state.toolMaxRounds=0;persistPolicy();renderBrowserTools();return browserToolState()},context:async()=>({session:commonsSessionId(),records:await commonsCtxAll()}),clearContext:()=>commonsCtxDeleteSession(),indexFile:commonsIndexFile,delegate:async(task,opts={})=>executeBrowserToolCall({function:{name:'delegate_subagent',arguments:JSON.stringify({task,...opts})}})};
+
+
 /* ---------- boot ---------- */
 (async()=>{
   compatibility();
   initSidebarLayout();
   await initIdentity();
   loadPolicy();
+  enableCommonsToolsDefault();
   await initChatSessions();
   $('#wsRelayUrls').value=localStorage.getItem('oim.wsRelayUrls')||'';
   $('#turnConfig').value=localStorage.getItem('oim.turnConfig')||'';
@@ -5897,6 +6088,9 @@ setInterval(updateMinimalWorkbenchStatus,1500);setTimeout(()=>{refreshModelSelec
   syncPolicyUI();
   hydrateHttpToolSpecs();
   renderBrowserTools();
+  commonsInstallContextSettings();
+  commonsInstallDropIngestion();
+  commonsCtxCleanup().then(()=>commonsCtxUnexpireSession()).catch(()=>{});
   await checkPermissions();
   renderEndpoints();renderPeerOffers();renderPeers();refreshModelSelect();renderStatePanel();updateShareSummary();
   resizeCanvas();updateStats();
